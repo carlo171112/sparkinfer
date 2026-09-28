@@ -320,6 +320,62 @@ void dflash_release_verify_cache() {
 static thread_local bool g_pf_hold_arena = false;
 void prefill_hold_arena(bool hold) { g_pf_hold_arena = hold; }
 
+namespace {
+// Long-prefill FFN weights are packed PTQ1 -> NVFP4 on every prompt (one kernel per
+// gate/up/down per layer). The bytes depend only on the weight pointer, so the second
+// prompt would repeat ~13 ms of identical work inside the timed prefill. Hold the packed
+// B operand and its CUTLASS scale. SPARKINFER_PREFILL_TFP4_WCACHE=0 packs every pass.
+struct Tfp4BCache {
+    const void* src;
+    unsigned char* d;
+    unsigned char* sfl;
+    int rows, k;
+};
+Tfp4BCache g_tfp4_bcache[256];
+int g_tfp4_bcache_n = 0;
+int g_tfp4_bcache_oom = 0;
+
+bool tfp4_bcache_on() {
+    static const int on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TFP4_WCACHE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return on != 0;
+}
+
+bool tfp4_bcache_bind(const void* src, int rows, int k, void** d, void** sfl, cudaStream_t st) {
+    if (!tfp4_bcache_on() || g_tfp4_bcache_oom || !src || rows <= 0 || k <= 0 || (k & 15)) return false;
+    for (int i = 0; i < g_tfp4_bcache_n; ++i) {
+        Tfp4BCache& e = g_tfp4_bcache[i];
+        if (e.src == src && e.rows == rows && e.k == k && e.d && e.sfl) {
+            *d = e.d;
+            *sfl = e.sfl;
+            return true;
+        }
+    }
+    if (g_tfp4_bcache_n >= 256) return false;
+    const size_t db = (size_t)rows * (size_t)k / 2;
+    const size_t rb = (size_t)rows * (size_t)k / 16;
+    const size_t sb = kernels::prefill_nvfp4_scale_bytes_b(rows, k);
+    unsigned char *dmem = nullptr, *rmem = nullptr, *smem = nullptr;
+    if (cudaMalloc(&dmem, db) != cudaSuccess) { g_tfp4_bcache_oom = 1; return false; }
+    if (cudaMalloc(&rmem, rb) != cudaSuccess) { cudaFree(dmem); g_tfp4_bcache_oom = 1; return false; }
+    if (cudaMalloc(&smem, sb) != cudaSuccess) { cudaFree(dmem); cudaFree(rmem); g_tfp4_bcache_oom = 1; return false; }
+    const bool ok = kernels::launch_ptq1_rows_nvfp4(src, dmem, rmem, rows, k, st) &&
+                    kernels::launch_ct_nvfp4_pack_sfb(rmem, smem, rows, k, st);
+    if (!ok || cudaStreamSynchronize(st) != cudaSuccess) {
+        cudaFree(dmem); cudaFree(rmem); cudaFree(smem);
+        return false;
+    }
+    cudaFree(rmem);
+    Tfp4BCache& e = g_tfp4_bcache[g_tfp4_bcache_n++];
+    e.src = src; e.d = dmem; e.sfl = smem; e.rows = rows; e.k = k;
+    *d = dmem;
+    *sfl = smem;
+    return true;
+}
+}  // namespace
+
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         int pos0) {
     const Qwen35Config& c = s.cfg;
@@ -3124,12 +3180,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     return fp4_parts(A_i8, fc8, ffn, &d, &r, &f, false) <= a_i8_sz &&
                            fp4_parts(A_i8, fc8, H, &d, &r, &f, false) <= a_i8_sz;
                 }() &&
-                kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, tg_r, ffn, H, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(tg_r, tg_s, ffn, H, st) &&
-                kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, tu_r, ffn, H, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(tu_r, tu_s, ffn, H, st) &&
-                kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, td_r, H, ffn, st) &&
-                kernels::launch_ct_nvfp4_pack_sfb(td_r, td_s, H, ffn, st);
+                ((tfp4_bcache_bind(gate_pf, ffn, H, &tg_d, &tg_s, st) &&
+                  tfp4_bcache_bind(up_pf, ffn, H, &tu_d, &tu_s, st) &&
+                  tfp4_bcache_bind(tl->down_q, H, ffn, &td_d, &td_s, st)) ||
+                 (kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, tg_r, ffn, H, st) &&
+                  kernels::launch_ct_nvfp4_pack_sfb(tg_r, tg_s, ffn, H, st) &&
+                  kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, tu_r, ffn, H, st) &&
+                  kernels::launch_ct_nvfp4_pack_sfb(tu_r, tu_s, ffn, H, st) &&
+                  kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, td_r, H, ffn, st) &&
+                  kernels::launch_ct_nvfp4_pack_sfb(td_r, td_s, H, ffn, st)));
             if (ffn_i8 && !ffn_qi8 && !tfp4) {
                 if (t_gu) {
                     kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
