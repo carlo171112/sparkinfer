@@ -2415,6 +2415,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return !(e && e[0] == '0');
     }();
     bool zero_for_down = false, zero_for_o = false;
+    // The FP4 o and down GEMMs leave the sandwich norm's branch as bf16, not int32 partials, so the
+    // fused pass above (norm_add_norm_quant_exact) never ran there: each residual site paid
+    // norm_then_add, then the exact norm + quantize reading its sum straight back. The bf16 twin
+    // does both in one pass, byte for byte. SPARKINFER_MUSE_NORM_ADD_Q=0 keeps the two launches.
+    static const bool muse_norm_add_q = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NORM_ADD_Q");
+        return !(e && e[0] == '0');
+    }();
     norm_xn(s.w.layers[0].input_norm, &s.w.layers[0]);
 
     // MoE aux events: overlap path and/or tiny shared-gate hide on stream_k.
@@ -3129,7 +3137,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_norm_then_add_acc(x, qb_partials, sx, w.wo_rs,
                                                       w.post_attn_norm, h, N, H, 1e-8f, st);
             } else if (!muse_tail_chunked) {
-                kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
+                hn_fp4_ready = hn_exact && muse_norm_add_q &&
+                    kernels::launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(
+                        x, ao, w.post_attn_norm, 1e-8f, h, w.ffn_norm, eps, hn, fp4_a, fp4_as,
+                        N, H, st);
+                if (!hn_fp4_ready)
+                    kernels::launch_norm_then_add(x, ao, w.post_attn_norm, h, N, H, 1e-8f, st);
             }
             // hn's only consumer is the grouped FFN's row-quantize, so emit the int8 in the same
             // pass. Only when one chunk covers the prompt: a second chunk would need A_i8/sx again
@@ -3835,7 +3848,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         kernels::launch_norm_then_add_acc(h, qb_partials, sx, w.down_rs,
                                                           w.post_ffn_norm, x, N, H, 1e-8f, st);
                 } else if (tail_rows != N) {   // re-running rows a chunk already did is harmless
-                    kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
+                    xn_done_early = muse_norm_add_q && xn_exact_for(nwf) &&
+                        kernels::launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(
+                            h, ao, w.post_ffn_norm, 1e-8f, x, nwf->input_norm, eps, xn, fp4_a,
+                            fp4_as, N, H, st);
+                    if (!xn_done_early)
+                        kernels::launch_norm_then_add(h, ao, w.post_ffn_norm, x, N, H, 1e-8f, st);
                 }
             } else if (!ffn_fused && !ffn_fp4_resid && !down_resid) {
                 // x += ffn_out (skipped when the down GEMM already accumulated into x per chunk,

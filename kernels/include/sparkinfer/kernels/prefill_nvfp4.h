@@ -36,6 +36,15 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void* residual, const 
                                                      cudaStream_t stream = nullptr,
                                                      // write zeros back over acc[0, m*k) once read
                                                      bool zero_acc = false);
+// The same fold when the branch is the bf16 tensor an FP4 GEMM wrote rather than int32 partials:
+// launch_norm_then_add (norm_then_add_reg_kernel) + launch_prefill_nvfp4_rmsnorm_quant_a_exact in
+// one pass, byte for byte what the two store. cols <= 8192.
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void* residual, const void* branch,
+                                                          const void* w_post, float eps_post,
+                                                          void* out_sum, const void* w_pre,
+                                                          float eps_pre, void* out_norm,
+                                                          void* dst_fp4, void* dst_sf, int m, int k,
+                                                          cudaStream_t stream = nullptr);
 // Muse's attention gate fused into the A-operand quantize: x * sigmoid(g) straight to FP4, the
 // same fold launch_prefill_gate_quant_rows_i8 does for the int8 o-projection.
 // gate_ld: row pitch of `gate` in elements, when it is a COLUMN SLICE of a wider packed

@@ -865,19 +865,24 @@ __global__ __launch_bounds__(kNormQuantThreads) void rmsnorm_quant_rows_exact(
 // of squares taken from those bf16 values in the order rmsnorm_kernel would read them back (same
 // 256-thread pack stride), and pass 3 is rmsnorm_quant_rows_exact's. Both bf16 tensors are still
 // written. The row stays in registers across the passes: cols <= 8 * 4 * 256.
-template <class Layout>
+//
+// BF: the branch arrives as the bf16 tensor an FP4 GEMM wrote instead of int32 partials, and pass 1
+// is norm_then_add_reg_kernel's (si_fused, fast-math): its sum of squares is fma.rn.ftz over the
+// bf16 values in the same pack order, and passes 2 and 3 are unchanged.
+template <class Layout, bool BF = false>
 __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
         const __nv_bfloat16* __restrict__ residual, const int* __restrict__ acc,
         const float* __restrict__ sxr, const float* __restrict__ rs,
         const __nv_bfloat16* __restrict__ w_post, float eps_post,
         __nv_bfloat16* __restrict__ out_sum, const __nv_bfloat16* __restrict__ w_pre,
         float eps_pre, __nv_bfloat16* __restrict__ out_norm, unsigned char* __restrict__ dst,
-        cutlass::float_ue4m3_t* __restrict__ sf, int rows, int cols, Layout layout, int zero_acc) {
+        cutlass::float_ue4m3_t* __restrict__ sf, int rows, int cols, Layout layout, int zero_acc,
+        const __nv_bfloat16* __restrict__ branch = nullptr) {
     constexpr int KP = 4;                       // packs per thread
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * cols;
-    const float sr = sxr[row];
+    const float sr = BF ? 0.f : sxr[row];
     __shared__ float s_warp[32];
     const int npack = cols >> 3;
     auto block_inv = [&](float ss, float eps) {
@@ -907,15 +912,21 @@ __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
     const uint4* r4 = reinterpret_cast<const uint4*>(residual + base);
     const uint4* wp4 = reinterpret_cast<const uint4*>(w_post);
     const uint4* w4 = reinterpret_cast<const uint4*>(w_pre);
+    const uint4* b4 = reinterpret_cast<const uint4*>(branch + base);
     int4 aq[KP][2];
     float4 sq[KP][2];
+    uint4 bq[KP];
     uint4 rq[KP], wpq[KP], wq3[KP];
     #pragma unroll
     for (int k = 0; k < KP; k++) {
         const int p = threadIdx.x + k * kNormQuantThreads;
         if (p < npack) {
-            aq[k][0] = a4[2 * p];     aq[k][1] = a4[2 * p + 1];
-            sq[k][0] = __ldg(rs4 + 2 * p); sq[k][1] = __ldg(rs4 + 2 * p + 1);
+            if constexpr (BF) {
+                bq[k] = __ldg(b4 + p);
+            } else {
+                aq[k][0] = a4[2 * p];     aq[k][1] = a4[2 * p + 1];
+                sq[k][0] = __ldg(rs4 + 2 * p); sq[k][1] = __ldg(rs4 + 2 * p + 1);
+            }
             rq[k] = __ldg(r4 + p); wpq[k] = __ldg(wp4 + p); wq3[k] = __ldg(w4 + p);
         }
     }
@@ -924,7 +935,14 @@ __global__ __launch_bounds__(kNormQuantThreads) void norm_add_norm_quant_exact(
     #pragma unroll
     for (int k = 0; k < KP; k++) {
         const int p = threadIdx.x + k * kNormQuantThreads;
-        if (p < npack) {
+        if (BF && p < npack) {
+            const __nv_bfloat16* bh = reinterpret_cast<const __nv_bfloat16*>(&bq[k]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                v[k][j] = __bfloat162float(bh[j]);
+                ss = fm_fma(v[k][j], v[k][j], ss);
+            }
+        } else if (!BF && p < npack) {
             const int ai[8] = {aq[k][0].x, aq[k][0].y, aq[k][0].z, aq[k][0].w,
                                aq[k][1].x, aq[k][1].y, aq[k][1].z, aq[k][1].w};
             const float sc[8] = {sq[k][0].x, sq[k][0].y, sq[k][0].z, sq[k][0].w,
@@ -1051,6 +1069,26 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void* residual, const 
         (const __nv_bfloat16*)residual, acc, sxr, rs, (const __nv_bfloat16*)w_post, eps_post,
         (__nv_bfloat16*)out_sum, (const __nv_bfloat16*)w_pre, eps_pre, (__nv_bfloat16*)out_norm,
         (unsigned char*)d, (cutlass::float_ue4m3_t*)sf, m, k, l, zero_acc ? 1 : 0);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void* residual, const void* branch,
+                                                          const void* w_post, float eps_post,
+                                                          void* out_sum, const void* w_pre,
+                                                          float eps_pre, void* out_norm, void* d,
+                                                          void* sf, int m, int k, cudaStream_t st) {
+    if (!residual || !branch || !w_post || !out_sum || !w_pre || !d || !sf ||
+        !prefill_nvfp4_supported(m,128,k) || (k & 15) || k > 8 * 4 * kNormQuantThreads)
+        return false;
+    // Every bf16 row is read and written 16 bytes at a time.
+    if (((reinterpret_cast<uintptr_t>(residual) | reinterpret_cast<uintptr_t>(branch) |
+          reinterpret_cast<uintptr_t>(out_sum) | reinterpret_cast<uintptr_t>(out_norm)) & 15) != 0)
+        return false;
+    auto l = sfa_layout(m,128,k);
+    norm_add_norm_quant_exact<decltype(l), true><<<m,kNormQuantThreads,0,st>>>(
+        (const __nv_bfloat16*)residual, nullptr, nullptr, nullptr, (const __nv_bfloat16*)w_post,
+        eps_post, (__nv_bfloat16*)out_sum, (const __nv_bfloat16*)w_pre, eps_pre,
+        (__nv_bfloat16*)out_norm, (unsigned char*)d, (cutlass::float_ue4m3_t*)sf, m, k, l, 0,
+        (const __nv_bfloat16*)branch);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 bool launch_prefill_nvfp4_gate_quant_a(const void* sr, const void* g, void* d, void* sf,

@@ -16,6 +16,10 @@ bool launch_prefill_nvfp4_norm_add_norm_quant_exact(const void*, const int*, con
                                                      const float*, const void*, float, void*,
                                                      const void*, float, void*, void*, void*, int,
                                                      int, cudaStream_t, bool) { return false; }
+bool launch_prefill_nvfp4_norm_add_norm_quant_bf16_exact(const void*, const void*, const void*,
+                                                          float, void*, const void*, float, void*,
+                                                          void*, void*, int, int,
+                                                          cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_gate_quant_a(const void*, const void*, void*, void*, int, int,
                                        cudaStream_t) { return false; }
 bool launch_prefill_nvfp4_swiglu_quant_a(const void*, const void*, void*, void*, int, int,
