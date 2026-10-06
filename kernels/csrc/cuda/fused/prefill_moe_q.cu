@@ -623,11 +623,145 @@ void dispatch_qi8(const signed char* A_i8, const float* sx, const void* W_q, con
 // (64->128) is covered by assigning 2 threads per weight row instead of 4 (dr = tid>>1 spans all
 // 128 rows; each thread decodes 2 of the super-block's 4 j64 groups instead of 1), so the same
 // bit-identical per-value decode still runs, just distributed differently across threads.
+// ---- Q4_K register prefetch for the short-N fused MoE GEMM ----
+// The bm16 kernel decodes a super-block, waits for it, multiplies, and only then loads the next one,
+// so every super-block pays a full DRAM latency with little else in flight. With the raw bytes of
+// super-block sb+1 held in registers -- loaded right after sb is decoded, consumed one MMA phase
+// later -- that latency overlaps the tensor-core work instead. A thread needs the 16-byte header
+// (d, dmin, 12 scale bytes) and its two 32-byte quant groups: five 16-byte loads, 20 registers.
+// The decode below is qm_decode_j64<Q4_K> reading those registers: the same scale unpack, the same
+// float products in the same order and the same lookup tables, so the int8 bytes are identical.
+struct QmQ4kRaw { uint4 hdr, q0a, q0b, q1a, q1b; };
+// Q5_K adds the 32-byte high-bit plane, shared by every group of the super-block.
+struct QmQ5kRaw { uint4 hdr, q0a, q0b, q1a, q1b, ha, hb; };
+
+__device__ __forceinline__ void qm_q5k_load(const unsigned char* __restrict__ blk, int dj, QmQ5kRaw& r) {
+    r.hdr = *reinterpret_cast<const uint4*>(blk);                 // 176 B blocks: 16 B aligned
+    r.ha = *reinterpret_cast<const uint4*>(blk + 16);
+    r.hb = *reinterpret_cast<const uint4*>(blk + 32);
+    const unsigned char* qa = blk + 48 + dj * 32;
+    const unsigned char* qb = blk + 48 + (dj + 2) * 32;
+    r.q0a = *reinterpret_cast<const uint4*>(qa);
+    r.q0b = *reinterpret_cast<const uint4*>(qa + 16);
+    r.q1a = *reinterpret_cast<const uint4*>(qb);
+    r.q1b = *reinterpret_cast<const uint4*>(qb + 16);
+}
+
+__device__ __forceinline__ void qm_q4k_load(const unsigned char* __restrict__ blk, int dj, QmQ4kRaw& r) {
+    r.hdr = *reinterpret_cast<const uint4*>(blk);                 // 144 B blocks: 16 B aligned
+    const unsigned char* qa = blk + 16 + dj * 32;
+    const unsigned char* qb = blk + 16 + (dj + 2) * 32;
+    r.q0a = *reinterpret_cast<const uint4*>(qa);
+    r.q0b = *reinterpret_cast<const uint4*>(qa + 16);
+    r.q1a = *reinterpret_cast<const uint4*>(qb);
+    r.q1b = *reinterpret_cast<const uint4*>(qb + 16);
+}
+
+// Byte k (0..11) of the scale array, which sits in hdr.y / hdr.z / hdr.w.
+__device__ __forceinline__ unsigned qm_scb(const uint4& h, int k) {
+    const unsigned w = (k < 4) ? h.y : (k < 8) ? h.z : h.w;
+    return (w >> (8 * (k & 3))) & 0xFFu;
+}
+
+__device__ __forceinline__ void qm_scale_min_hdr(const uint4& h, int j, int* s, int* m) {
+    if (j < 4) { *s = (int)(qm_scb(h, j) & 63u); *m = (int)(qm_scb(h, j + 4) & 63u); }
+    else {
+        *s = (int)((qm_scb(h, j + 4) & 0xFu) | ((qm_scb(h, j - 4) >> 6) << 4));
+        *m = (int)((qm_scb(h, j + 4) >> 4)   | ((qm_scb(h, j)     >> 6) << 4));
+    }
+}
+
+__device__ __forceinline__ void qm_q4k_decode_raw(const uint4& h, const uint4& qa, const uint4& qb,
+                                                  int j64, float inv, signed char* __restrict__ dst) {
+    const float bd    = __half2float(__ushort_as_half((unsigned short)(h.x & 0xFFFFu)));
+    const float bdmin = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    int s0, m0, s1, m1;
+    qm_scale_min_hdr(h, 2 * j64,     &s0, &m0);
+    qm_scale_min_hdr(h, 2 * j64 + 1, &s1, &m1);
+    const float ds0 = bd * s0, dm0 = bdmin * m0;
+    const float ds1 = bd * s1, dm1 = bdmin * m1;
+    unsigned ta[4], tb[4];
+    qm_lut16(ds0, dm0, inv, ta);
+    qm_lut16(ds1, dm1, inv, tb);
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const uint4 qv = c ? qb : qa;
+        uint4 vlo, vhi;
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            const unsigned qwd = (w == 0) ? qv.x : (w == 1) ? qv.y : (w == 2) ? qv.z : qv.w;
+            const unsigned alo = qm_gather4(ta, qwd & 0x0F0F0F0Fu);
+            const unsigned ahi = qm_gather4(tb, (qwd >> 4) & 0x0F0F0F0Fu);
+            if (w == 0)      { vlo.x = alo; vhi.x = ahi; }
+            else if (w == 1) { vlo.y = alo; vhi.y = ahi; }
+            else if (w == 2) { vlo.z = alo; vhi.z = ahi; }
+            else             { vlo.w = alo; vhi.w = ahi; }
+        }
+        *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
+        *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
+    }
+}
+
+// qm_decode_j64<Q5_K>'s per-value path on prefetched registers: same nibbles, same high bit
+// (bit 2*j64 / 2*j64+1 of qh byte l), same float expression and rounding.
+__device__ __forceinline__ void qm_q5k_decode_raw(const QmQ5kRaw& r, bool second, int j64, float inv,
+                                                  signed char* __restrict__ dst) {
+    const uint4& h = r.hdr;
+    const float bd    = __half2float(__ushort_as_half((unsigned short)(h.x & 0xFFFFu)));
+    const float bdmin = __half2float(__ushort_as_half((unsigned short)(h.x >> 16)));
+    int s0, m0, s1, m1;
+    qm_scale_min_hdr(h, 2 * j64,     &s0, &m0);
+    qm_scale_min_hdr(h, 2 * j64 + 1, &s1, &m1);
+    const float ds0 = bd * s0, dm0 = bdmin * m0;
+    const float ds1 = bd * s1, dm1 = bdmin * m1;
+    const int shl = 2 * j64, shh = 2 * j64 + 1;
+#pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const uint4 qv = second ? (c ? r.q1b : r.q1a) : (c ? r.q0b : r.q0a);
+        const uint4 hv = c ? r.hb : r.ha;
+        uint4 vlo, vhi;
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            const unsigned qwd = (w == 0) ? qv.x : (w == 1) ? qv.y : (w == 2) ? qv.z : qv.w;
+            const unsigned hwd = (w == 0) ? hv.x : (w == 1) ? hv.y : (w == 2) ? hv.z : hv.w;
+            unsigned alo = 0, ahi = 0;
+#pragma unroll
+            for (int b = 0; b < 4; b++) {
+                const int sb8 = 8 * b;
+                const unsigned byte = (qwd >> sb8) & 0xFFu;
+                const unsigned hb = (hwd >> sb8) & 0xFFu;
+                int nlo = (int)(byte & 0xFu), nhi = (int)(byte >> 4);
+                nlo += ((hb >> shl) & 1u) ? 16 : 0;
+                nhi += ((hb >> shh) & 1u) ? 16 : 0;
+                const int qlo = (int)roundf((ds0 * nlo - dm0) * inv);
+                const int qhi = (int)roundf((ds1 * nhi - dm1) * inv);
+                alo |= ((unsigned)(qlo & 0xFF)) << sb8;
+                ahi |= ((unsigned)(qhi & 0xFF)) << sb8;
+            }
+            if (w == 0)      { vlo.x = alo; vhi.x = ahi; }
+            else if (w == 1) { vlo.y = alo; vhi.y = ahi; }
+            else if (w == 2) { vlo.z = alo; vhi.z = ahi; }
+            else             { vlo.w = alo; vhi.w = ahi; }
+        }
+        *reinterpret_cast<uint4*>(dst + j64 * 64 + c * 16) = vlo;
+        *reinterpret_cast<uint4*>(dst + j64 * 64 + 32 + c * 16) = vhi;
+    }
+}
+
 constexpr int QM_BM16 = 16;
 constexpr int QM_BN16 = 128;
 
-template <int QT, bool A_INDIRECT, bool C_SCATTER>
-__global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
+// BN (weight rows per block) is 64 by default, or QM_BN16 = 128: 64 halves the B tile in shared memory
+// (17 KB instead of 35), so four or more blocks reside per SM instead of two and their weight loads
+// hide each other's DRAM latency -- the kernel loads a super-block, then waits on it, with nothing
+// else in flight. Threads = 2 per weight row either way, so every per-value decode, MMA and
+// epilogue is the 128-row kernel's, only fewer rows per block: bit-identical output.
+// BM (rows of an expert per tile) is 16, or 32: two 16-row MMA tiles share every decoded B
+// super-block. At 512 tokens an expert averages 16 pairs and ~43% of experts hold more (Poisson),
+// so with 16-row tiles those experts' weights were decoded and read twice; 32-row tiles read each
+// expert's slice about once. Per-row arithmetic is unchanged.
+template <int QT, bool A_INDIRECT, bool C_SCATTER, int BN = QM_BN16, bool PF = false, int BM = QM_BM16>
+__global__ __launch_bounds__(2 * BN, BN == QM_BN16 ? 2 : 5) void pfm_moe_gemm_qi8_bm16_kernel(
         const signed char* __restrict__ A_i8, const float* __restrict__ sx,
         const unsigned char* __restrict__ W_q, const float* __restrict__ row_scale,
         const int* __restrict__ pair_tok, const float* __restrict__ pair_w,
@@ -641,15 +775,16 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     if (tile >= d_ntiles[0]) return;
     const int e   = tilemap[2 * tile];
     const int mt  = tilemap[2 * tile + 1];
-    const int p0  = offsets[e] + mt * QM_BM16;
+    constexpr int MT = BM / 16;             // 16-row MMA tiles per block
+    const int p0  = offsets[e] + mt * BM;
     const int cnt = offsets[e + 1] - offsets[e];
-    const int M   = min(QM_BM16, cnt - mt * QM_BM16);
-    const int n0  = blockIdx.x * QM_BN16;
+    const int M   = min(BM, cnt - mt * BM);
+    const int n0  = blockIdx.x * BN;
     const int nsb = K >> 8;
 
-    __shared__ __align__(16) signed char Bs[QM_BN16][QM_LD];
-    __shared__ __align__(16) signed char As[2][QM_BM16][QM_BK];
-    __shared__ int s_tok[QM_BM16];
+    __shared__ __align__(16) signed char Bs[BN][QM_LD];
+    __shared__ __align__(16) signed char As[2][BM][QM_BK];
+    __shared__ int s_tok[BM];
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
@@ -657,10 +792,10 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
 
     const float* swe = row_scale + (size_t)e * N;
 
-    for (int r = tid; r < QM_BM16; r += blockDim.x)
+    for (int r = tid; r < BM; r += blockDim.x)
         s_tok[r] = (r < M) ? (A_INDIRECT ? pair_tok[p0 + r] : (p0 + r)) : -1;
 
-    // 2 threads per weight row (covers all QM_BN16=128 rows); each decodes 2 of the 4 j64 groups
+    // 2 threads per weight row (covers all BN rows); each decodes 2 of the 4 j64 groups
     // of the super-block (dj, dj+2) instead of the BM=128 kernel's 1-of-4 (4 threads/row). Same
     // qm_decode_j64 primitive, same bit-identical per-value math -- only the thread->work mapping
     // changes to cover twice the rows with the same 256 threads.
@@ -671,11 +806,12 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     const float dscale = drow_ok ? swe[dgn] : 0.f;
     const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, int> cf;
-    wmma::fill_fragment(cf, 0);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> cf[MT];
+#pragma unroll
+    for (int mi = 0; mi < MT; mi++) wmma::fill_fragment(cf[mi], 0);
 
     auto stageA = [&](int buf, int k0) {
-        for (int idx = tid; idx < QM_BM16 * 2; idx += blockDim.x) {
+        for (int idx = tid; idx < BM * 2; idx += blockDim.x) {
             const int r = idx >> 1, c16 = (idx & 1) * 16;
             const int arow = s_tok[r];
             qm_cp16(&As[buf][r][c16], &A_i8[(size_t)max(arow, 0) * K + k0 + c16],
@@ -687,13 +823,29 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     __syncthreads();          // s_tok published before stageA reads it
     stageA(0, 0);
     int abuf = 0;
+    constexpr bool PFQ = PF && QT == QMQ_Q4_K;
+    constexpr bool PF5 = PF && QT == QMQ_Q5_K;
+    QmQ4kRaw raw;
+    QmQ5kRaw raw5;
+    if constexpr (PFQ) { if (drow_ok) qm_q4k_load(drow, dj, raw); }
+    if constexpr (PF5) { if (drow_ok) qm_q5k_load(drow, dj, raw5); }
 
     for (int sb = 0; sb < nsb; sb++) {
         __syncthreads();      // previous super-block's MMA finished reading Bs
         if (drow_ok) {
-            const unsigned char* blk = drow + (size_t)sb * BS;
-            qm_decode_j64<QT>(blk, dj,     dinv, &Bs[dr][0]);
-            qm_decode_j64<QT>(blk, dj + 2, dinv, &Bs[dr][0]);
+            if constexpr (PFQ) {
+                qm_q4k_decode_raw(raw.hdr, raw.q0a, raw.q0b, dj,     dinv, &Bs[dr][0]);
+                qm_q4k_decode_raw(raw.hdr, raw.q1a, raw.q1b, dj + 2, dinv, &Bs[dr][0]);
+                if (sb + 1 < nsb) qm_q4k_load(drow + (size_t)(sb + 1) * BS, dj, raw);
+            } else if constexpr (PF5) {
+                qm_q5k_decode_raw(raw5, false, dj,     dinv, &Bs[dr][0]);
+                qm_q5k_decode_raw(raw5, true,  dj + 2, dinv, &Bs[dr][0]);
+                if (sb + 1 < nsb) qm_q5k_load(drow + (size_t)(sb + 1) * BS, dj, raw5);
+            } else {
+                const unsigned char* blk = drow + (size_t)sb * BS;
+                qm_decode_j64<QT>(blk, dj,     dinv, &Bs[dr][0]);
+                qm_decode_j64<QT>(blk, dj + 2, dinv, &Bs[dr][0]);
+            }
         } else if (dj == 0) {
 #pragma unroll
             for (int i = 0; i < QM_SB / 16; i++)
@@ -708,11 +860,14 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
             __syncthreads();
 #pragma unroll
             for (int k16 = 0; k16 < QM_BK; k16 += 16) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
-                wmma::load_matrix_sync(af, &As[abuf][0][k16], QM_BK);
                 wmma::load_matrix_sync(bf, &Bs[wn * 16][kk + k16], QM_LD);
-                wmma::mma_sync(cf, af, bf, cf);
+#pragma unroll
+                for (int mi = 0; mi < MT; mi++) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+                    wmma::load_matrix_sync(af, &As[abuf][mi * 16][k16], QM_BK);
+                    wmma::mma_sync(cf[mi], af, bf, cf[mi]);
+                }
             }
             __syncthreads();
             abuf ^= 1;
@@ -722,16 +877,18 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     // Epilogue staging reuses Bs (the K loop is done with it).
     __syncthreads();
     int* Cs = reinterpret_cast<int*>(&Bs[0][0]);
-    {
+#pragma unroll
+    for (int mi = 0; mi < MT; mi++) {
         const int gn0 = n0 + wn * 16;
-        wmma::store_matrix_sync(&Cs[warp * 256], cf, 16, wmma::mem_row_major);
+        int* cw = &Cs[(warp * MT + mi) * 256];
+        wmma::store_matrix_sync(cw, cf[mi], 16, wmma::mem_row_major);
         __syncwarp();
         for (int el = lane; el < 256; el += 32) {
             const int r = el >> 4, cc = el & 15;
-            const int rm = r, rn = gn0 + cc;
+            const int rm = mi * 16 + r, rn = gn0 + cc;
             if (rm < M && rn < N) {
                 const int p = p0 + rm;
-                const float v = (float)Cs[warp * 256 + el]
+                const float v = (float)cw[el]
                                 * sx[A_INDIRECT ? s_tok[rm] : p] * swe[rn];
                 if (C_SCATTER) atomicAdd(&out_f32[(size_t)pair_tok[p] * N + rn], v * pair_w[p]);
                 else           C[(size_t)p * N + rn] = __float2bfloat16(v);
@@ -741,14 +898,48 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_bm16_kernel(
     }
 }
 
+static int pfm_qm_bm16_bn() {
+    static const int bn = [] {
+        const char* e = getenv("SPARKINFER_QM_BM16_BN");
+        return (e && atoi(e) == 128) ? QM_BN16 : 64;
+    }();
+    return bn;
+}
+
 template <int QT>
 void dispatch_qi8_bm16(const signed char* A_i8, const float* sx, const void* W_q, const float* row_scale,
                        const int* pair_tok, const float* pair_w, const int* offsets,
                        const int* tilemap, const int* d_ntiles,
                        __nv_bfloat16* C, float* out_f32, int n_out, int K, int max_tiles,
-                       bool a_indirect, bool c_scatter, cudaStream_t stream) {
-    dim3 grid((n_out + QM_BN16 - 1) / QM_BN16, max_tiles);
+                       bool a_indirect, bool c_scatter, cudaStream_t stream, int bm = QM_BM16) {
+    // The narrow 64-row blocks by default (see the kernel): Qwen3.6-35B-A3B prefill +5% at 128
+    // tokens and +7% at 512. SPARKINFER_QM_BM16_BN=128 restores the 128-row blocks.
+    const int bn = pfm_qm_bm16_bn();
     const auto* W = reinterpret_cast<const unsigned char*>(W_q);
+    // SPARKINFER_QM_PREFETCH=0 turns off the Q4_K / Q5_K register prefetch (see qm_q4k_load).
+    static const bool pf = [] {
+        const char* e = getenv("SPARKINFER_QM_PREFETCH");
+        return !(e && e[0] == '0');
+    }();
+    if (bn == 64) {
+        dim3 g64((n_out + 63) / 64, max_tiles);
+#define SI_QM64B(AI, CS, BMV) do { if (pf && (QT == QMQ_Q4_K || QT == QMQ_Q5_K))                     \
+            pfm_moe_gemm_qi8_bm16_kernel<QT, AI, CS, 64, true, BMV><<<g64, 128, 0, stream>>>(      \
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K); \
+            else pfm_moe_gemm_qi8_bm16_kernel<QT, AI, CS, 64, false, BMV><<<g64, 128, 0, stream>>>( \
+                A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K); } while (0)
+#define SI_QM64(AI, CS) do { if (bm == 64) SI_QM64B(AI, CS, 64); else if (bm == 32) SI_QM64B(AI, CS, 32); \
+                                 else SI_QM64B(AI, CS, QM_BM16); } while (0)
+        if (a_indirect && !c_scatter)      SI_QM64(true, false);
+        else if (!a_indirect && c_scatter) SI_QM64(false, true);
+        else if (a_indirect && c_scatter)  SI_QM64(true, true);
+        else                               SI_QM64(false, false);
+#undef SI_QM64
+#undef SI_QM64B
+        return;
+    }
+    if (bm != QM_BM16) return;   // 32-row tiles exist only in the 64-row-block form
+    dim3 grid((n_out + QM_BN16 - 1) / QM_BN16, max_tiles);
     if (a_indirect && !c_scatter)
         pfm_moe_gemm_qi8_bm16_kernel<QT, true, false><<<grid, 256, 0, stream>>>(
             A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K);
@@ -838,6 +1029,261 @@ __device__ __forceinline__ void qm_mma_16832(int (&d)[4], const unsigned (&a)[4]
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// One thread's Q5_K register stage in the 4-threads-a-row layout: the header, the 32-byte high-bit
+// plane and its own j64's 32 quant bytes (q0a / q0b; q1 unused). qm_q5k_decode_raw(r, false, j64)
+// then decodes exactly what qm_decode_j64<Q5_K> reads from global.
+__device__ __forceinline__ void qm_q5k_load1(const unsigned char* __restrict__ blk, int j64, QmQ5kRaw& r) {
+    r.hdr = *reinterpret_cast<const uint4*>(blk);
+    r.ha  = *reinterpret_cast<const uint4*>(blk + 16);
+    r.hb  = *reinterpret_cast<const uint4*>(blk + 32);
+    const unsigned char* q = blk + 48 + j64 * 32;
+    r.q0a = *reinterpret_cast<const uint4*>(q);
+    r.q0b = *reinterpret_cast<const uint4*>(q + 16);
+}
+
+// ---- The routed BM=128 GEMM, pipelined and on m16n8k32 ----
+// pfm_moe_gemm_qi8_kernel (above) decodes a weight super-block straight from global, waits at a
+// barrier, then runs the wmma 16x16x16 MMAs: the DRAM read is serialized against the tensor cores,
+// and only other resident blocks -- which tend to sit in the same phase -- can hide it. At a served
+// mixed step's 4096 tokens (32K routed pairs, ~128 an expert) its gate and up GEMMs ran at ~165
+// int8 TOPS and the Q5_K down at ~135. This is the dense kernel's (pf_dense_gemm_qi8_kernel_g)
+// recipe applied to the routed tile: a second Bs plane, super-block sb+1's bytes fetched into
+// registers before sb's MMAs and decoded after them (qm_stage_fetch / qm_stage_decode), and the
+// K loop on m16n8k32 through ldmatrix with the A tile XOR-swizzled. The tile, the gathered A rows,
+// the epilogue and every int8 byte are the routed kernel's; integer accumulation is exact, so each
+// output is bit-identical to it (the scattered down keeps its float atomicAdd order either way).
+// BMT is the pair-row tile: 128, or 64 for the 512-2048-token steps whose tilemap the caller
+// builds with 64-row tiles (moe_bm). At 64 the eight warps sit 2 x 4 (32 rows x 16 columns each)
+// instead of 4 x 2 (32 x 32); the weight plane, its decode and the epilogue are the same.
+template <int QT, bool A_INDIRECT, bool C_SCATTER, int BMT = QM_BM>
+__global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
+        const signed char* __restrict__ A_i8, const float* __restrict__ sx,
+        const unsigned char* __restrict__ W_q, const float* __restrict__ row_scale,
+        const int* __restrict__ pair_tok, const float* __restrict__ pair_w,
+        const int* __restrict__ offsets, const int* __restrict__ tilemap,
+        const int* __restrict__ d_ntiles,
+        __nv_bfloat16* __restrict__ C, float* __restrict__ out_f32,
+        int N, int K) {
+    constexpr int BS = qm_bs<QT>();
+    const int tile = blockIdx.y;
+    if (tile >= d_ntiles[0]) return;
+    const int e   = tilemap[2 * tile];
+    const int mt  = tilemap[2 * tile + 1];
+    static_assert(BMT == 128 || BMT == 64, "tile heights the warp grid is laid out for");
+    constexpr int WMS = BMT / 32, WNS = 8 / WMS;            // warps along M / N
+    constexpr int WC = QM_BN / WNS, NJ2 = WC / 16;          // a warp's columns; 16-col groups
+    const int p0  = offsets[e] + mt * BMT;
+    const int cnt = offsets[e + 1] - offsets[e];
+    const int M   = min(BMT, cnt - mt * BMT);
+    const int n0  = blockIdx.x * QM_BN;
+    const int nsb = K >> 8;
+
+    __shared__ __align__(16) signed char Bs[2][QM_BN][QM_LD];
+    // A ring: NA K-steps of the activation tile in flight. With two buffers only the next step was
+    // ever in flight, and a step's MMAs are too short to cover its L2 fetch -- at K=512 (the down)
+    // that wait came sixteen times a tile. Three planes at 128 rows, four at 64 (48 KB of static
+    // shared memory is the cap either way).
+    constexpr int NA = BMT == 128 ? 3 : 4;
+    __shared__ __align__(16) signed char As[NA][BMT][QM_BK];
+    __shared__ int s_tok[BMT];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp % WMS, wn = warp / WMS;
+    const float* swe = row_scale + (size_t)e * N;
+
+    for (int r = tid; r < BMT; r += blockDim.x)
+        s_tok[r] = (r < M) ? (A_INDIRECT ? pair_tok[p0 + r] : (p0 + r)) : -1;
+
+    // Decode assignment: 4 threads per weight row, one 64-value sub-block pair (j64) each.
+    const int dr = tid >> 2, dj = tid & 3;
+    const int dgn = n0 + dr;
+    const bool drow_ok = dgn < N;
+    const unsigned char* drow = W_q + ((size_t)e * N + (drow_ok ? dgn : 0)) * (size_t)nsb * BS;
+    const float dscale = drow_ok ? swe[dgn] : 0.f;
+    const float dinv = (dscale > 0.f) ? (1.f / dscale) : 0.f;
+
+    int acc[2][2 * NJ2][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 2 * NJ2; j++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) acc[i][j][q] = 0;
+
+    // A staging: one 16 B chunk per thread per K step, into the same swizzled layout the dense
+    // kernel's ldmatrix reads (chunk order flipped on rows whose bit 2 is set).
+    // At BMT=64 only the first 128 threads have a chunk; the rest commit empty groups.
+    static_assert(BMT * 2 <= 256, "stageA: at most one 16 B chunk per thread at 256 threads");
+    const bool a_thr = tid < BMT * 2;
+    const int a_r = a_thr ? (tid >> 1) : 0, a_c16 = (tid & 1) * 16;
+    const int a_swz = 16 * ((a_r >> 2) & 1);
+    signed char* const a_dst0 = &As[0][a_r][a_c16 ^ a_swz];
+    __syncthreads();          // s_tok published before stageA reads it
+    const int a_row = s_tok[a_r];
+    const bool a_ok = a_row >= 0;
+    const signed char* const a_src0 = A_i8 + (size_t)max(a_row, 0) * K + a_c16;
+    auto stageA = [&](int buf, int k0) {
+        if (a_thr) qm_cp16(a_dst0 + buf * (BMT * QM_BK), a_src0 + k0, a_ok);
+        __pipeline_commit();
+    };
+
+    const int arr = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const unsigned a_sm = (unsigned)__cvta_generic_to_shared(
+        &As[0][wm * 32 + arr][16 * (((lane >> 4) & 1) ^ ((arr >> 2) & 1))]);
+    const unsigned b_sm = (unsigned)__cvta_generic_to_shared(
+        &Bs[0][wn * WC + ((lane >> 4) & 1) * 8 + (lane & 7)][16 * ((lane >> 3) & 1)]);
+
+    const int nks = K / QM_BK;                           // K steps
+#pragma unroll
+    for (int s0 = 0; s0 < NA - 1; s0++) {               // prologue: the first NA-1 steps in flight
+        if (s0 < nks) stageA(s0, s0 * QM_BK);
+        else          __pipeline_commit();
+    }
+    int bbuf = 0, kstep = 0;
+    QmStage<QT> stg;
+    QmQ5kRaw st5;     // Q5_K's register stage (QmStage only carries a pointer for it)
+    auto fetch = [&](const unsigned char* blk) {
+        if constexpr (QT == QMQ_Q5_K) qm_q5k_load1(blk, dj, st5);
+        else                          qm_stage_fetch<QT>(blk, dj, stg);
+    };
+    auto decode = [&](signed char* dst) {
+        if constexpr (QT == QMQ_Q5_K) qm_q5k_decode_raw(st5, false, dj, dinv, dst);
+        else                          qm_stage_decode<QT>(stg, dj, dinv, dst);
+    };
+    if (drow_ok) {
+        fetch(drow);
+        decode(&Bs[0][dr][0]);
+    } else if (dj == 0) {
+#pragma unroll
+        for (int i = 0; i < QM_SB / 16; i++) {
+            *reinterpret_cast<uint4*>(&Bs[0][dr][i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+            *reinterpret_cast<uint4*>(&Bs[1][dr][i * 16]) = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+
+    for (int sb = 0; sb < nsb; sb++) {
+        __syncthreads();      // Bs[bbuf] decoded; the MMA that read Bs[bbuf ^ 1] is done
+        const bool more = (sb + 1) < nsb;
+        if (more && drow_ok) fetch(drow + (size_t)(sb + 1) * BS);
+        for (int kk = 0; kk < QM_SB; kk += QM_BK, kstep++) {
+            // ONE barrier a K step. Wait for step kstep's own copies, then the barrier publishes
+            // them AND proves every warp is past step kstep-1 -- so only after it is the slot step
+            // kstep-1 used refilled, with step kstep+NA-1. (Issuing that copy before the barrier
+            // is what needed a second barrier at the bottom of every step.) Every thread commits
+            // one group per step -- empty past the end -- so the count stays uniform.
+            __pipeline_wait_prior(NA - 2);
+            __syncthreads();
+            const int kfut = kstep + NA - 1;
+            if (kfut < nks) stageA(kfut % NA, kfut * QM_BK);
+            else            __pipeline_commit();
+            const unsigned ab = a_sm + (unsigned)(kstep % NA) * (BMT * QM_BK);
+            unsigned af32[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; i++) qm_ldsm_x4(af32[i], ab + (unsigned)(i * 16 * QM_BK));
+#pragma unroll
+            for (int j2 = 0; j2 < NJ2; j2++) {
+                unsigned bb[4];
+                qm_ldsm_x4(bb, b_sm + (unsigned)bbuf * (QM_BN * QM_LD) + (unsigned)(j2 * 16 * QM_LD) + (unsigned)kk);
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    qm_mma_16832(acc[i][2 * j2],     af32[i], bb[0], bb[1]);
+                    qm_mma_16832(acc[i][2 * j2 + 1], af32[i], bb[2], bb[3]);
+                }
+            }
+        }
+        if (more && drow_ok) decode(&Bs[bbuf ^ 1][dr][0]);
+        bbuf ^= 1;
+    }
+
+    // Epilogue: the routed kernel's, fed from the m16n8k32 accumulators.
+    __syncthreads();
+    int* Cs = reinterpret_cast<int*>(&Bs[0][0][0]);
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+#pragma unroll
+        for (int j = 0; j < NJ2; j++) {
+            const int rm0 = wm * 32 + i * 16, gn0 = n0 + wn * WC + j * 16;
+#pragma unroll
+            for (int hh = 0; hh < 2; hh++) {
+                const int* d = acc[i][2 * j + hh];
+                const int rb = lane >> 2, cb = hh * 8 + 2 * (lane & 3);
+                Cs[warp * 256 + rb * 16 + cb]           = d[0];
+                Cs[warp * 256 + rb * 16 + cb + 1]       = d[1];
+                Cs[warp * 256 + (rb + 8) * 16 + cb]     = d[2];
+                Cs[warp * 256 + (rb + 8) * 16 + cb + 1] = d[3];
+            }
+            __syncwarp();
+            if (C_SCATTER) {
+                // Four consecutive columns a lane, one vector reduction each: a quarter of the
+                // atomics a lane-per-element loop issues (67M a layer at 4096 tokens on Qwen3.6's
+                // down, which is what bound it). Each element is the same ((acc * sx) * scale) * w
+                // product; the float sums land in whatever order the reductions retire, as before.
+                // N is a multiple of QM_BN, so a row's four columns are all in range together.
+#pragma unroll
+                for (int it = 0; it < 2; ++it) {
+                    const int r = it * 8 + (lane >> 2), c4 = (lane & 3) * 4;
+                    const int rm = rm0 + r, rn = gn0 + c4;
+                    if (rm < M && rn < N) {
+                        const int p = p0 + rm;
+                        const float sxv = sx[A_INDIRECT ? s_tok[rm] : p], pw = pair_w[p];
+                        const int* cs = &Cs[warp * 256 + r * 16 + c4];
+                        const float v0 = ((float)cs[0] * sxv * swe[rn])     * pw;
+                        const float v1 = ((float)cs[1] * sxv * swe[rn + 1]) * pw;
+                        const float v2 = ((float)cs[2] * sxv * swe[rn + 2]) * pw;
+                        const float v3 = ((float)cs[3] * sxv * swe[rn + 3]) * pw;
+                        float* dst = &out_f32[(size_t)pair_tok[p] * N + rn];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+                        asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+                                     :: "l"(dst), "f"(v0), "f"(v1), "f"(v2), "f"(v3) : "memory");
+#else
+                        atomicAdd(dst, v0); atomicAdd(dst + 1, v1); atomicAdd(dst + 2, v2); atomicAdd(dst + 3, v3);
+#endif
+                    }
+                }
+            } else
+            for (int el = lane; el < 256; el += 32) {
+                const int r = el >> 4, cc = el & 15;
+                const int rm = rm0 + r, rn = gn0 + cc;
+                if (rm < M && rn < N) {
+                    const int p = p0 + rm;
+                    const float v = (float)Cs[warp * 256 + el]
+                                    * sx[A_INDIRECT ? s_tok[rm] : p] * swe[rn];
+                    if (C_SCATTER) atomicAdd(&out_f32[(size_t)pair_tok[p] * N + rn], v * pair_w[p]);
+                    else           C[(size_t)p * N + rn] = __float2bfloat16(v);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// SPARKINFER_PREFILL_MOE_K32=0 keeps the routed BM=128 GEMM on pfm_moe_gemm_qi8_kernel.
+static bool qm_moe_k32() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_MOE_K32");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+template <int QT, int BMT = QM_BM>
+void dispatch_qi8_k32(const signed char* A_i8, const float* sx, const void* W_q, const float* row_scale,
+                      const int* pair_tok, const float* pair_w, const int* offsets,
+                      const int* tilemap, const int* d_ntiles,
+                      __nv_bfloat16* C, float* out_f32, int n_out, int K, int max_tiles,
+                      bool a_indirect, bool c_scatter, cudaStream_t stream) {
+    dim3 grid((n_out + QM_BN - 1) / QM_BN, max_tiles);
+    const auto* W = reinterpret_cast<const unsigned char*>(W_q);
+#define SI_QK32(AI, CS) pfm_moe_gemm_qi8_k32_kernel<QT, AI, CS, BMT><<<grid, 256, 0, stream>>>( \
+        A_i8, sx, W, row_scale, pair_tok, pair_w, offsets, tilemap, d_ntiles, C, out_f32, n_out, K)
+    if (a_indirect && !c_scatter)      SI_QK32(true, false);
+    else if (!a_indirect && c_scatter) SI_QK32(false, true);
+    else if (a_indirect && c_scatter)  SI_QK32(true, true);
+    else                               SI_QK32(false, false);
+#undef SI_QK32
 }
 
 // SPARKINFER_MUSE_MMA_K32=0 restores the wmma 16x16x16 inner loop (A/B; bit-identical either way).
@@ -1720,8 +2166,21 @@ static bool qm_tall_on() {
 
 } // namespace
 
+// Q6_K experts too: llama.cpp's UD quants give a few MoE layers a Q6_K ffn_down_exps (Qwen3.6-35B-A3B
+// UD-Q4_K_M: 3 of 40), and each of those materialized its whole int8 expert pool on every prefill
+// (deq_rows_i8<Q6_K>: 0.91 ms a layer at 512 tokens, 6% of the pass). The decode is the dense
+// path's qm_decode_j64<Q6_K> (ushort loads: a 210-byte block is only 2-byte aligned), and the
+// per-row scales come from the same load-time precompute (launch_gguf_dequant_rows_i8 decodes Q6_K),
+// so the fused GEMM produces the materialize path's int8 bytes exactly.
+// SPARKINFER_PFM_Q6K=0 sends Q6_K experts back to the materialize path (A/B).
+bool pfm_moe_gemm_qi8_k32_enabled() { return qm_moe_k32(); }
+
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
-    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K;
+    static const bool q6k = [] {
+        const char* e = getenv("SPARKINFER_PFM_Q6K");
+        return !(e && e[0] == '0');
+    }();
+    return ggml_type == QMQ_Q4_K || ggml_type == QMQ_Q5_K || (q6k && ggml_type == QMQ_Q6_K);
 }
 
 // The DENSE fused GEMM additionally decodes Q6_K (see qm_decode_j64). Kept separate from the
@@ -1767,26 +2226,58 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
                              int n_out, int K, int max_tiles, int bm,
                              bool a_indirect, bool c_scatter, cudaStream_t stream) {
     if (!pfm_moe_gemm_qi8_supported(ggml_type)) return false;
-    if (bm != QM_BM && bm != QM_BM16) return false;       // tilemap must match one of these
+    if (bm != QM_BM && bm != QM_BM16 && bm != 32 && bm != 64) return false;   // tilemap must match
+    if ((bm == 32 || bm == 64) && pfm_qm_bm16_bn() != 64) return false;      // see dispatch_qi8_bm16
     if (K <= 0 || (K & (QM_SB - 1)) != 0) return false;   // whole super-blocks only
     if (!row_scale || max_tiles <= 0) return false;
     auto* C = reinterpret_cast<__nv_bfloat16*>(C_bf16);
-    if (bm == QM_BM16) {
+    // 64-row tiles on the pipelined m16n8k32 kernel too (SPARKINFER_PREFILL_MOE_K32, as at 128).
+    if (bm == 64 && qm_moe_k32() && n_out > 0 && (n_out % QM_BN) == 0) {
+        if (ggml_type == QMQ_Q4_K)
+            dispatch_qi8_k32<QMQ_Q4_K, 64>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                           d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        else if (ggml_type == QMQ_Q5_K)
+            dispatch_qi8_k32<QMQ_Q5_K, 64>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                           d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        else
+            dispatch_qi8_k32<QMQ_Q6_K, 64>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                           d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        return true;
+    }
+    if (bm == QM_BM16 || bm == 32 || bm == 64) {
         if (n_out <= 0 || (n_out % QM_BN16) != 0) return false;
         if (ggml_type == QMQ_Q4_K)
             dispatch_qi8_bm16<QMQ_Q4_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
-                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
-        else
+                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream, bm);
+        else if (ggml_type == QMQ_Q5_K)
             dispatch_qi8_bm16<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
-                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream, bm);
+        else
+            dispatch_qi8_bm16<QMQ_Q6_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                        d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream, bm);
         return true;
     }
     if (n_out <= 0 || (n_out % QM_BN) != 0) return false;
+    if (qm_moe_k32()) {
+        if (ggml_type == QMQ_Q4_K)
+            dispatch_qi8_k32<QMQ_Q4_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                       d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        else if (ggml_type == QMQ_Q5_K)
+            dispatch_qi8_k32<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                       d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        else
+            dispatch_qi8_k32<QMQ_Q6_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                                       d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+        return true;
+    }
     if (ggml_type == QMQ_Q4_K)
         dispatch_qi8<QMQ_Q4_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
-    else
+    else if (ggml_type == QMQ_Q5_K)
         dispatch_qi8<QMQ_Q5_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
+                               d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
+    else
+        dispatch_qi8<QMQ_Q6_K>(A_i8, sx, W_q, row_scale, pair_tok, pair_w, offsets, tilemap,
                                d_ntiles, C, out_f32, n_out, K, max_tiles, a_indirect, c_scatter, stream);
     return true;
 }

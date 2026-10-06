@@ -4,9 +4,12 @@
 #include "sparkinfer/device_health.h"
 
 #include <mutex>
+#include <deque>
+#include <memory>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -77,6 +80,28 @@ struct ContinuousBatchEngine::Job {
     std::vector<int> output;
     std::string error;
     std::function<bool(int)> on_token;  // false return = cancel
+    // ASYNC EMISSION (SPARKINFER_ASYNC_EMIT, on unless =0). The caller's callbacks -- for a
+    // streamed chat, incremental detokenization, the stop filter, the SSE JSON and a socket write
+    // -- ran on the worker thread, one row after another, while the device idled: ~4 ms of every
+    // 19 ms step at 32 rows. With a queue, on_token/on_token_logprob only enqueue, and the
+    // request's own thread (wait_locked) runs the callbacks, all requests in parallel. A callback
+    // that returns false sets `stop`, which on_token reports to the worker on its next token; the
+    // result is cut back to the tokens the callback took.
+    struct EmitQueue {
+        struct Event {
+            bool is_logprob = false;
+            int token = -1;
+            Qwen35Model::TokenLogprob lp;
+        };
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Event> events;
+        bool stop = false;     // the caller's on_token returned false
+        bool closed = false;   // the job is done: nothing more will be queued
+        std::function<bool(int)> user_token;
+        std::function<void(const Qwen35Model::TokenLogprob&)> user_logprob;
+    };
+    std::shared_ptr<EmitQueue> emit;
     // Optional. Delivered one step_job() call AFTER forward_token() actually computed it -- see
     // step_job()'s implementation for why (worker_loop() interleaves step_job() across jobs
     // sharing one Qwen35Model instance, so the logprobs data must be read out of the model's
@@ -102,6 +127,7 @@ struct ContinuousBatchEngine::Job {
     // Prefix cache: tokens this job started from rather than prefilled, and the recurrent-state
     // snapshots taken at req.cache_checkpoints (offered to the cache in finish_job_impl).
     int cached_tokens = 0;
+    int mixed_tokens = 0;      // prompt tokens mixed steps have ingested (step_jobs_packed)
     struct Checkpoint {
         int pos = 0;
         Qwen35Model::RecurrentStateSnapshot state;
@@ -258,7 +284,18 @@ int ContinuousBatchEngine::num_active() const {
     return n;
 }
 
-int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
+// Free blocks plus those only the prefix cache holds: admission evicts the cache for those
+// (PrefixCache::evict_for), so for a caller sizing what it may send they are free. The refcounts
+// behind the second term change under the device mutex, so they are read only while holding it --
+// and only if it is free: /v1/capacity and /metrics must not wait out a long prefill. Otherwise the
+// last count stands.
+int ContinuousBatchEngine::num_free_kv_blocks() const {
+    if (prefix_cache_) {
+        std::unique_lock<std::recursive_mutex> lock(model_->device_mutex(), std::try_to_lock);
+        if (lock.owns_lock()) evictable_last_.store(prefix_cache_->evictable_blocks(), std::memory_order_relaxed);
+    }
+    return kv_->num_free_blocks() + (prefix_cache_ ? evictable_last_.load(std::memory_order_relaxed) : 0);
+}
 
 int ContinuousBatchEngine::num_waiting() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -335,15 +372,651 @@ ContinuousBatchEngine::SpecStats ContinuousBatchEngine::speculative_stats() cons
     return s;
 }
 
+namespace {
+// SPARKINFER_SPEC_PREFIX_HIT=0: a prefix-cache hit decodes without speculation, and a speculated
+// prompt takes no prefix-cache checkpoints (the behaviour before either did).
+bool prefix_hit_spec_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_SPEC_PREFIX_HIT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+}  // namespace
+
+// A request already decoding that a speculation group can carry without a draft: its next token is
+// ready to emit, and it would speculate if it were fresh (the verify has none of the other sampler
+// extras either).
+bool ContinuousBatchEngine::spec_adoptable(const Job& j) {
+    return !j.done && j.phase == SeqPhase::DECODE && j.next_token >= 0 && spec_eligible(j.req);
+}
+
 bool ContinuousBatchEngine::spec_eligible(const Request& r) {
-    // Speculation is lossless only for greedy argmax, and the verify path has none of the sampler
-    // extras. A constraint must stay on the per-token path where its mask is applied. Images need
-    // the vision splice ordinary prefill does; a prefix-cache hit starts past position 0, where the
-    // capture the draft reads would have a hole.
-    return !r.constraint && r.temperature <= 0.f && r.presence_penalty == 0.f &&
+    // A sampled request speculates too: every verify row draws its token with the request's
+    // sampler at that token's own step (SpecHooks), so the output is the one ordinary sampled
+    // decode gives. SPARKINFER_SPEC_SAMPLED=0 keeps speculation greedy-only. The verify path has
+    // none of the other sampler extras (penalties, logit bias, logprobs). A constraint must stay
+    // on the per-token path where its mask is applied. Images need the vision splice ordinary
+    // prefill does. A prefix-cache hit speculates too: prefill resumes past the cached prefix and
+    // the draft reads the target's hidden states from there (SpecHooks::prefill_start).
+    static const bool sampled_on = [] {
+        const char* e = getenv("SPARKINFER_SPEC_SAMPLED");
+        return !(e && e[0] == '0');
+    }();
+    return !r.constraint && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
-           r.forced_tokens.empty() && r.vision_pos.empty() && r.prefill_start == 0 &&
-           !r.use_prefix_session;
+           r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session &&
+           (r.prefill_start == 0 || prefix_hit_spec_on());
+}
+
+namespace {
+// SPARKINFER_SPEC_GROUP: how many live requests speculate together, at most 8. Their blocks share
+// one verify of kQwen35MaxPackedRows rows, so past four each verifies a shorter block. 1 keeps the
+// single-request path (dflash_generate), which stops speculating once a second request arrives.
+// Measured on Qwen3.8-27B + DFlash2 (batched draft), real prompts at T=0.7, aggregate tok/s at
+// c4/c6/c8: 646/422/650 with 4, 652/768/861 with 8.
+int spec_group_max() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP");
+        const int x = e ? atoi(e) : 8;
+        return std::max(1, std::min(x, 8));
+    }();
+    return v;
+}
+bool spec_group_trace() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_TRACE");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+}  // namespace
+
+void ContinuousBatchEngine::run_spec_group() {
+    const Qwen35Config& cfg = model_->config();
+    const int G = spec_group_max();
+    const int depth = model_->spec_group_depth();
+    const double timeout_s = request_timeout_s_config();
+    struct Member {
+        Job* job = nullptr;
+        int slot = 0;
+        int pos = 0;                 // position of `next`
+        int next = -1;               // the verified token at `pos`, not yet ingested
+        bool next_emitted = false;   // ...but already handed out (a join's seed)
+        std::vector<int> block;      // [next, proposals...]
+        bool have_block = false;
+        int feed_off = 0, feed_len = 0;   // this member's rows of the last verify's capture
+        // A join whose prompt tail rides the next verify (spec_group_join_body): `block` holds the
+        // tail, committed whole, and the last row's token is the seed; `first_block` then marks
+        // that the slot's first draft block (over the whole prompt) is still to run.
+        bool tail_pending = false, first_block = false;
+        // Its draft's record, decayed: proposals accepted, and verifies that ended in a rejection.
+        // q = (acc + 1) / (acc + rej + 2) estimates the chance its next proposal is accepted.
+        float acc = 2.f, rej = 1.f;
+        // Past the draft's context (spec_group_reach): it stays in the group without proposals, its
+        // block just `next`, so a one-row verify decodes it while the others keep speculating.
+        bool no_draft = false;
+        bool adopted = false;   // joined while decoding ordinarily (never speculated)
+        bool done = false;
+    };
+    std::vector<Member> members;
+    std::vector<bool> slot_used((size_t)G, false);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& kv : jobs_)
+            if (!kv.second->done) kv.second->spec_tried = true;
+    }
+    if (!model_->spec_group_begin()) return;
+    // Requests already decoding join as members without a draft: their next token, not yet emitted,
+    // is the block, and each step's verify ingests it at prompt + decode_emitted and draws the one
+    // after with step decode_emitted + 1 -- the position and sampler step of the ordinary decode
+    // step (step_job). The arithmetic differs as a group's does: the grouped verify's kernels, and
+    // the GDN state in fp32 where packed decode keeps rounding it to bf16. At the group's end,
+    // handoff gives them back as they were. The fresh prompts join one a step below and speculate.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto& kv : jobs_) {
+            Job* j = kv.second.get();
+            if (!spec_adoptable(*j)) continue;
+            // Not adopted if its state cannot take the verify's form: it then counts as waiting and
+            // not fresh, and the group ends at its first join check, as before adoption existed.
+            if (!model_->spec_adopt_session(j->seq_id)) continue;
+            Member m;
+            m.job = j;
+            m.slot = -1;
+            m.pos = (int)j->req.prompt.size() + j->decode_emitted;
+            m.next = j->next_token;
+            m.next_emitted = false;
+            m.no_draft = true;
+            m.adopted = true;
+            members.push_back(m);
+        }
+    }
+    if (spec_group_trace())
+        fprintf(stderr, "[spec-group] start (group %d, depth %d, %zu adopted)\n", G, depth, members.size());
+    int trace_steps = 0, trace_rows = 0, trace_kept = 0;
+    double trace_draft_ms = 0, trace_join_ms = 0, trace_verify_ms = 0;
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+    auto idx_of_next = [](const Member& m) {
+        return (unsigned long long)(m.job->decode_emitted - (m.next_emitted ? 1 : 0));
+    };
+    auto finish = [&](Member& m) {
+        Job& job = *m.job;
+        job.generation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - job.t_submit).count();
+        if (job.saw_first_tok && job.generation_ms > job.ttft_ms && job.decode_emitted > 0) {
+            const double decode_ms = std::max(job.generation_ms - job.ttft_ms, 1.0);
+            job.decode_tps = (double)job.decode_emitted * 1000.0 / decode_ms;
+        }
+        finish_job_impl(job);
+        if (m.slot >= 0) slot_used[(size_t)m.slot] = false;   // an adopted member has none
+        m.done = true;
+    };
+    // Hand one token to the caller as run_speculative does. False when the request stops here
+    // (callback, timeout, EOS, its token limit) -- the member is finished.
+    auto emit = [&](Member& m, int tok) -> bool {
+        Job& job = *m.job;
+        const auto t = std::chrono::steady_clock::now();
+        if (!job.saw_first_tok) {
+            job.t_first = t;
+            job.saw_first_tok = true;
+            job.ttft_ms = std::chrono::duration<double, std::milli>(job.t_first - job.t_submit).count();
+        }
+        job.output.push_back(tok);
+        job.decode_emitted++;
+        if (job.on_token && !job.on_token(tok)) { job.cancelled = true; finish(m); return false; }
+        if (timeout_s > 0.0 &&
+            std::chrono::duration<double>(t - job.t_submit).count() > timeout_s) {
+            job.error = "request timeout";
+            job.timed_out = true;
+            finish(m);
+            return false;
+        }
+        const bool eos = !job.req.ignore_eos && (tok == cfg.eos_id || (cfg.eos_id2 >= 0 && tok == cfg.eos_id2));
+        const bool limit = job.decode_emitted >= job.req.max_new_tokens;
+        if (eos || limit) {
+            job.reached_token_limit = limit && !eos;
+            finish(m);
+            return false;
+        }
+        return true;
+    };
+    // Back to ordinary decode at the committed position, as run_speculative hands over: the next
+    // step_job emits next_token and ingests it at prompt_len + decode_emitted.
+    auto handoff = [&](Member& m) {
+        Job& job = *m.job;
+        if (m.next_emitted) {
+            // The seed went out but was never ingested: ingest it as the next decode step would.
+            // (finish below takes mu_, so not under the device lock: admission takes them the
+            // other way round.)
+            int after = -1;
+            {
+                std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+                model_->activate_session(job.seq_id);
+                after = model_->forward_token(m.next, m.pos, true, job.req.temperature, job.req.seed,
+                                              idx_of_next(m) + 1, job.req.top_k, job.req.top_p);
+            }
+            if (after < 0 || after >= cfg.vocab) {
+                job.error = "speculative decode failed; the request was aborted";
+                job.internal_error = true;
+                finish(m);
+                return;
+            }
+            m.next = after;
+            m.pos += 1;
+        }
+        job.prefill_pos = (int)job.req.prompt.size();
+        job.phase = SeqPhase::DECODE;
+        job.next_token = m.next;
+        if (!m.adopted) spec_handoffs_.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto live_members = [&] {
+        int n = 0;
+        for (const Member& m : members) n += !m.done;
+        return n;
+    };
+    // A lone member's verify (8-row equivalent) and draft times, for its depth choice.
+    float single_v8 = 14.f, single_draft = 1.8f;
+    bool leave = false;
+    const int reach = model_->spec_group_reach();
+    for (;;) {
+        // 0. A member that has reached the end of the draft's context stops drafting: its next block
+        //    would draft and capture past it. It stays in the group and verifies one row a step
+        //    (lossless, as every verify is), so the others keep speculating. Ending the group for it
+        //    stopped speculation for every member, and for the load, as soon as one answer passed
+        //    16K tokens (a thinking model without max_tokens).
+        for (Member& m : members) {
+            if (m.done || m.no_draft || m.pos <= reach) continue;
+            m.no_draft = true;
+            if (spec_group_trace())
+                fprintf(stderr, "[spec-group] a member reached the draft's context (%d): it drafts no more\n", m.pos);
+        }
+        for (Member& m : members)
+            if (!m.done && m.no_draft && !m.have_block) {
+                m.block.assign(1, m.next);
+                m.have_block = true;
+            }
+        // 1. Drafts, from the hidden rows each member's last verify captured (consumed before a
+        //    join below re-arms the capture buffers).
+        auto t_draft = std::chrono::steady_clock::now();
+        for (Member& m : members) {
+            if (m.done || !m.first_block || leave) continue;
+            const Job& job = *m.job;
+            std::vector<int> prop((size_t)depth, -1);
+            const char* hid = static_cast<const char*>(model_->dflash_hidden_buffer()) +
+                              (size_t)m.feed_off * model_->dflash_hidden_row_stride() * 2;
+            if (!model_->spec_group_join_finish(m.slot, m.pos, m.feed_len, hid, m.next, job.req.temperature,
+                                                (unsigned long long)job.req.seed, job.req.top_k, job.req.top_p,
+                                                prop.data())) {
+                leave = true;
+                break;
+            }
+            m.first_block = false;
+            m.block.assign(1, m.next);
+            m.block.insert(m.block.end(), prop.begin(), prop.end());
+            m.have_block = true;
+        }
+        if (!leave) {
+            // Every member that needs a block, drafted in one pass where the draft can
+            // (spec_group_draft_multi); the loop below takes whatever is left.
+            std::vector<Member*> need;
+            for (Member& m : members)
+                if (!m.done && !m.have_block) need.push_back(&m);
+            if (need.size() >= 2) {
+                const size_t n = need.size();
+                std::vector<int> slots(n), th(n), seeds(n), pos(n), topk(n), prop(n * (size_t)depth, -1);
+                std::vector<const void*> hid(n);
+                std::vector<float> temp(n), topp(n);
+                std::vector<unsigned long long> srng(n), step(n);
+                const char* base = static_cast<const char*>(model_->dflash_hidden_buffer());
+                const size_t row_bytes = (size_t)model_->dflash_hidden_row_stride() * 2;
+                for (size_t i = 0; i < n; ++i) {
+                    const Member& m = *need[i];
+                    slots[i] = m.slot;
+                    hid[i] = base + (size_t)m.feed_off * row_bytes;
+                    th[i] = m.feed_len;
+                    seeds[i] = m.next;
+                    pos[i] = m.pos;
+                    temp[i] = m.job->req.temperature;
+                    srng[i] = (unsigned long long)m.job->req.seed;
+                    step[i] = idx_of_next(m) + 1;
+                    topk[i] = m.job->req.top_k;
+                    topp[i] = m.job->req.top_p;
+                }
+                if (model_->spec_group_draft_multi((int)n, slots.data(), hid.data(), th.data(), seeds.data(),
+                                                   pos.data(), temp.data(), srng.data(), step.data(),
+                                                   topk.data(), topp.data(), prop.data())) {
+                    for (size_t i = 0; i < n; ++i) {
+                        Member& m = *need[i];
+                        m.block.assign(1, m.next);
+                        m.block.insert(m.block.end(), prop.begin() + (long)(i * depth),
+                                       prop.begin() + (long)((i + 1) * depth));
+                        m.have_block = true;
+                    }
+                }
+            }
+        }
+        for (Member& m : members) {
+            if (leave) break;
+            if (m.done || m.have_block) continue;
+            const Job& job = *m.job;
+            std::vector<int> prop((size_t)depth, -1);
+            const char* hid = static_cast<const char*>(model_->dflash_hidden_buffer()) +
+                              (size_t)m.feed_off * model_->dflash_hidden_row_stride() * 2;
+            if (!model_->spec_group_draft(m.slot, hid, m.feed_len, m.next, m.pos, job.req.temperature,
+                                          job.req.seed, idx_of_next(m) + 1, job.req.top_k,
+                                          job.req.top_p, prop.data())) {
+                leave = true;
+                break;
+            }
+            m.block.assign(1, m.next);
+            m.block.insert(m.block.end(), prop.begin(), prop.end());
+            m.have_block = true;
+        }
+        trace_draft_ms += ms_since(t_draft);
+        if (members.size() == 1 && !members[0].done) single_draft = 0.8f * single_draft + 0.2f * (float)ms_since(t_draft);
+        // 2. One arrival joins per step, if the group can take it; anything else ends the group.
+        Job* joiner = nullptr;
+        auto t_join = std::chrono::steady_clock::now();
+        if (!leave) {
+            std::lock_guard<std::mutex> lock(mu_);
+            // Count everything waiting first. Each check below only asks whether ONE more fits, so
+            // 15 prompts arriving behind one member all "fit" and joined one at a time -- an 8K
+            // join is a 0.6 s speculative prefill with its own draft slot and capture -- until the
+            // group was full, and then the next one ended it anyway. Measured: AIPerf 8K prompts
+            // at 16 concurrent, 4-5 joins per burst, the 5th out of memory and on the token loop
+            // (83 s), 38 tok/s against 167 without a draft. When they cannot all join, none should.
+            int waiting = 0;
+            for (auto& kv : jobs_) {
+                const Job* j = kv.second.get();
+                if (j->done) continue;
+                bool member = false;
+                for (const Member& m : members) member = member || (!m.done && m.job == j);
+                if (!member) ++waiting;
+            }
+            if (live_members() + waiting > G) {
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] leave: %d waiting, %d members, group of %d\n",
+                            waiting, live_members(), G);
+                leave = true;
+            }
+            for (auto& kv : jobs_) {
+                if (leave) break;
+                Job* j = kv.second.get();
+                if (j->done) continue;
+                bool member = false;
+                for (const Member& m : members) member = member || (!m.done && m.job == j);
+                if (member) continue;
+                const bool fits = j->phase == SeqPhase::PREFILL && j->prefill_pos == j->req.prefill_start &&
+                                  spec_eligible(j->req) && live_members() + (joiner ? 2 : 1) <= G;
+                if (fits && joiner) continue;   // one join per step: it joins on the next one
+                if (!fits) {
+                    if (spec_group_trace())
+                        fprintf(stderr, "[spec-group] leave: request %llu cannot join "
+                                        "(phase %d, eligible %d, members %d)\n",
+                                (unsigned long long)kv.first, (int)j->phase, (int)spec_eligible(j->req),
+                                live_members());
+                    leave = true;
+                    break;
+                }
+                joiner = j;
+            }
+            if (joiner) joiner->spec_tried = true;
+        }
+        if (!leave && joiner) {
+            // The join grows the session past its admission budget by a block or two (the verify's
+            // lookahead): make sure a pool the prefix cache has filled has them.
+            if (prefix_cache_) {
+                std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+                prefix_cache_->evict_for(4);
+            }
+            int slot = 0;
+            while (slot < G && slot_used[(size_t)slot]) ++slot;
+            Qwen35Model::SpecHooks hooks;
+            hooks.seq_id = joiner->seq_id;
+            hooks.temperature = joiner->req.temperature;
+            hooks.seed = joiner->req.seed;
+            hooks.top_k = joiner->req.top_k;
+            hooks.top_p = joiner->req.top_p;
+            hooks.ignore_eos = joiner->req.ignore_eos;
+            hooks.prefill_start = joiner->req.prefill_start;
+            const int n = (int)joiner->req.prompt.size();
+            std::vector<int> ckpts;
+            std::vector<Qwen35Model::RecurrentStateSnapshot> snaps;
+            if (prefix_hit_spec_on() && prefix_cache_ && joiner->req.prefix_cache) {
+                for (int ck : joiner->req.cache_checkpoints)
+                    if (ck > joiner->req.prefill_start && ck < n && ck % kv_->block_size() == 0)
+                        ckpts.push_back(ck);
+                std::sort(ckpts.begin(), ckpts.end());
+                ckpts.erase(std::unique(ckpts.begin(), ckpts.end()), ckpts.end());
+                snaps.resize(ckpts.size());
+                hooks.ckpts = ckpts.data();
+                hooks.n_ckpts = (int)ckpts.size();
+                hooks.snaps = snaps.data();
+            }
+            // With others speculating, a prompt ending in a partial group of eight prefills only its
+            // aligned body here and verifies the rest in the group's next verify: one forward
+            // fewer than prefilling the tail on its own. SPARKINFER_SPEC_JOIN_TAIL=0 keeps the
+            // whole prefill here.
+            static const bool join_tail = [] {
+                const char* e = getenv("SPARKINFER_SPEC_JOIN_TAIL");
+                return !(e && e[0] == '0');
+            }();
+            int body = 0;
+            if (join_tail && live_members() >= 1 && ckpts.empty() &&
+                model_->spec_group_join_body(joiner->req.prompt, joiner->req.max_new_tokens, slot, hooks,
+                                             &body) == 0) {
+                Member tm;
+                tm.job = joiner;
+                tm.slot = slot;
+                tm.pos = body;
+                tm.block.assign(joiner->req.prompt.begin() + body, joiner->req.prompt.end());
+                tm.have_block = true;
+                tm.tail_pending = true;
+                slot_used[(size_t)slot] = true;
+                members.push_back(std::move(tm));
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] join: %d-token prompt, body %d, tail in the verify, slot %d\n", n,
+                            body, slot);
+            } else {
+                Qwen35Model::SpecResume r;
+                std::vector<int> prop((size_t)depth, -1);
+                Member nm;
+                nm.job = joiner;
+                nm.slot = slot;
+                nm.pos = n;
+                slot_used[(size_t)slot] = true;
+                bool seed_out = false;
+                // The seed goes out the moment prefill has drawn it, ahead of the first draft block
+                // (which reads the whole prompt context), as dflash_generate hands its seed over.
+                hooks.on_tokens = [&](const int* toks, int) -> bool {
+                    if (r.ckpts_taken)
+                        for (size_t i = 0; i < ckpts.size(); ++i) {
+                            Job::Checkpoint cp;
+                            cp.pos = ckpts[i];
+                            cp.state = std::move(snaps[i]);
+                            joiner->checkpoints.push_back(std::move(cp));
+                        }
+                    joiner->prefill_pos = n;
+                    joiner->phase = SeqPhase::DECODE;
+                    spec_runs_.fetch_add(1, std::memory_order_relaxed);
+                    seed_out = true;
+                    nm.next = toks[0];
+                    if (!emit(nm, toks[0])) return false;
+                    nm.next_emitted = true;
+                    return true;
+                };
+                const int seed = model_->spec_group_join(joiner->req.prompt, joiner->req.max_new_tokens,
+                                                         slot, hooks, &r, prop.data());
+                if (spec_group_trace())
+                    fprintf(stderr, "[spec-group] join: %zu-token prompt, slot %d, seed %d\n",
+                            joiner->req.prompt.size(), slot, seed);
+                if (nm.done) {
+                    // Finished at its seed (EOS, a one-token limit, a cancel): nothing more to do.
+                } else if (seed_out && seed >= 0) {
+                    nm.block.assign(1, nm.next);
+                    nm.block.insert(nm.block.end(), prop.begin(), prop.end());
+                    nm.have_block = true;
+                    members.push_back(std::move(nm));
+                } else if (seed_out) {
+                    // Prefilled and its seed handed out, but the first draft block failed: the member
+                    // goes to ordinary decode with the others below.
+                    members.push_back(std::move(nm));
+                    leave = true;
+                } else {
+                    slot_used[(size_t)slot] = false;
+                    if (r.failed) {
+                        joiner->error = "speculative prefill failed; the request was aborted";
+                        joiner->internal_error = true;
+                        finish_job_impl(*joiner);
+                    }
+                    leave = true;   // otherwise nothing ran: the ordinary path prefills it
+                }
+            }
+        }
+        if (joiner) trace_join_ms += ms_since(t_join);
+        // Nothing left to speculate (every member drafts no more and nobody joined): ordinary packed
+        // decode carries those requests faster than one-row verifies.
+        if (!leave && !joiner && live_members() > 0) {
+            bool any_draft = false;
+            for (const Member& m : members) any_draft = any_draft || (!m.done && !m.no_draft);
+            if (!any_draft) {
+                if (spec_group_trace()) fprintf(stderr, "[spec-group] leave: no member drafts\n");
+                leave = true;
+            }
+        }
+        if (leave) break;
+        // 3. One verify for every member's block.
+        std::vector<Member*> act;
+        for (Member& m : members) if (!m.done && m.have_block) act.push_back(&m);
+        if (act.empty()) {
+            if (live_members() == 0) {
+                std::lock_guard<std::mutex> lock(mu_);
+                bool more = false;
+                for (auto& kv : jobs_) more = more || !kv.second->done;
+                if (!more) break;    // nothing left to speculate
+                continue;            // a new arrival joins on the next pass
+            }
+            continue;
+        }
+        const int n = (int)act.size();
+        std::vector<uint64_t> seqs((size_t)n);
+        std::vector<const int*> blocks((size_t)n);
+        std::vector<int> lens((size_t)n), starts((size_t)n), keep((size_t)n, 0);
+        std::vector<float> temp((size_t)n), top_p((size_t)n);
+        std::vector<unsigned long long> seedv((size_t)n), step((size_t)n);
+        std::vector<int> top_k((size_t)n);
+        bool any_sampled = false;
+        int rows = 0;
+        // The verify takes kQwen35MaxPackedRows rows: past four members each verifies a shorter
+        // block (the draft still proposes its full depth; the rest is not scored). A joiner's
+        // prompt tail (at most 7 rows) is verified whole, committed, and the others share the rest.
+        std::unique_ptr<bool[]> commit(new bool[(size_t)n]());
+        bool any_commit = false;
+        // Members without a draft take one row each and are not counted among the sharers: seven
+        // adopted beside one drafter would otherwise have cut its block to four rows.
+        int tail_rows = 0, n_spec = 0, one_rows = 0;
+        for (int g = 0; g < n; ++g) {
+            const Member& m = *act[(size_t)g];
+            if (m.tail_pending) tail_rows += (int)m.block.size();
+            else if (m.no_draft) ++one_rows;
+            else ++n_spec;
+        }
+        const int row_cap = std::max(2, (kQwen35MaxPackedRows - tail_rows - one_rows) / std::max(n_spec, 1));
+        // A request speculating alone verifies the depth that makes the most tokens per ms. Its
+        // single-sequence verify costs, relative to 8 rows, about kRel[L] (measured at ~1K context:
+        // 10.45 / 10.36 / 10.89 / 11.20 / 12.46 / 13.76 / 13.18 / 14.11 ms for 1..8 rows), scaled by
+        // what this run's verifies take (v8, tracked), plus the draft (d, tracked); row L is kept with
+        // probability ~q^L. A predictable stream keeps its whole block; a hard one stops paying for
+        // rows it would reject (14.5K-token prose: 97 -> 119 tok/s). In a group, rows are nearly free
+        // (a 4 x 8 verify costs 15.2 ms against 12.4 for 1 x 8), so members keep their blocks there.
+        // SPARKINFER_SPEC_ADAPTIVE_ROWS=0 always verifies the whole block.
+        static const bool adaptive_rows = [] {
+            const char* e = getenv("SPARKINFER_SPEC_ADAPTIVE_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        static constexpr float kRel[9] = {0.f, 0.74f, 0.73f, 0.77f, 0.79f, 0.88f, 0.98f, 0.93f, 1.f};
+        std::vector<int> want((size_t)n);
+        for (int g = 0; g < n; ++g) {
+            const Member& m = *act[(size_t)g];
+            want[(size_t)g] = m.tail_pending ? (int)m.block.size() : std::min((int)m.block.size(), row_cap);
+        }
+        if (adaptive_rows && n == 1 && !act[0]->tail_pending && want[0] > 2 && want[0] <= 8) {
+            const Member& m = *act[0];
+            const float q = (m.acc + 1.f) / (m.acc + m.rej + 2.f);
+            int best = want[0];
+            float best_rate = 0.f, e = 0.f, qp = 1.f;
+            for (int L = 1; L <= want[0]; ++L) {
+                e += qp;   // expected tokens kept from L rows: 1 + q + ... + q^(L-1)
+                qp *= q;
+                if (L < 2) continue;
+                const float rate = e / (single_v8 * kRel[L] + single_draft);
+                if (rate > best_rate) { best_rate = rate; best = L; }
+            }
+            want[0] = best;
+        }
+        for (int g = 0; g < n; ++g) {
+            Member& m = *act[(size_t)g];
+            seqs[(size_t)g] = m.job->seq_id;
+            blocks[(size_t)g] = m.block.data();
+            lens[(size_t)g] = want[(size_t)g];
+            commit[(size_t)g] = m.tail_pending;
+            any_commit = any_commit || m.tail_pending;
+            starts[(size_t)g] = m.pos;
+            temp[(size_t)g] = m.job->req.temperature;
+            seedv[(size_t)g] = (unsigned long long)m.job->req.seed;
+            // A tail's last row draws the seed, which prefill samples at step 0 (row i is drawn at
+            // step[g] + i; unsigned wrap is the intent).
+            step[(size_t)g] = m.tail_pending ? (unsigned long long)(1 - lens[(size_t)g]) : idx_of_next(m) + 1;
+            top_k[(size_t)g] = m.job->req.top_k;
+            top_p[(size_t)g] = m.job->req.top_p;
+            any_sampled = any_sampled || temp[(size_t)g] > 0.f;
+            rows += lens[(size_t)g];
+        }
+        Qwen35Model::PackedSampling samp;
+        samp.temperature = temp.data();
+        samp.seed = seedv.data();
+        samp.step = step.data();
+        samp.top_k = top_k.data();
+        samp.top_p = top_p.data();
+        std::vector<int> out((size_t)rows, -1);
+        auto t_verify = std::chrono::steady_clock::now();
+        if (!model_->spec_group_verify(n, seqs.data(), blocks.data(), lens.data(), starts.data(),
+                                       any_sampled ? &samp : nullptr, out.data(), keep.data(),
+                                       any_commit ? commit.get() : nullptr)) {
+            // A verify that fails has committed nothing. An adopted member is still exactly where its
+            // ordinary decode left it, so it goes back to that decode with the rest (leave, below)
+            // instead of failing a request that was never speculating.
+            for (Member* pm : act) {
+                if (pm->adopted && !pm->next_emitted) continue;
+                pm->job->error = "speculative decode failed; the request was aborted";
+                pm->job->internal_error = true;
+                finish(*pm);
+            }
+            leave = true;
+            break;
+        }
+        trace_verify_ms += ms_since(t_verify);
+        if (n == 1 && lens[0] >= 1 && lens[0] <= 8)
+            single_v8 = 0.8f * single_v8 + 0.2f * (float)ms_since(t_verify) / kRel[lens[0]];
+        ++trace_steps;
+        trace_rows += rows;
+        for (int g = 0; g < n; ++g) trace_kept += keep[(size_t)g];
+        // 4. Each member's accepted prefix, and its bonus token as the next seed.
+        for (int g = 0, off = 0; g < n; off += lens[(size_t)g], ++g) {
+            Member& m = *act[(size_t)g];
+            const int k = keep[(size_t)g];
+            if (m.tail_pending) {
+                // The prompt is in: its last row's token is the seed, emitted now, and the slot's
+                // first draft block runs at the next step's draft, from these rows.
+                Job& job = *m.job;
+                m.tail_pending = false;
+                m.pos += k;
+                m.next = out[(size_t)(off + k - 1)];
+                m.feed_off = off;
+                m.feed_len = k;
+                m.have_block = false;
+                job.prefill_pos = (int)job.req.prompt.size();
+                job.phase = SeqPhase::DECODE;
+                spec_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (emit(m, m.next)) {
+                    m.next_emitted = true;
+                    m.first_block = true;
+                }
+                continue;
+            }
+            // The draft's record: k - 1 of its lens - 1 scored proposals accepted, and a rejection
+            // unless every one was. A one-row verify scored none and says nothing.
+            if (lens[(size_t)g] > 1) {
+                m.acc = 0.9f * m.acc + (float)(k - 1);
+                m.rej = 0.9f * m.rej + (k < lens[(size_t)g] ? 1.f : 0.f);
+            }
+            bool going = true;
+            for (int i = (m.next_emitted ? 1 : 0); i < k && going; ++i) going = emit(m, m.block[(size_t)i]);
+            if (!going) continue;
+            m.next_emitted = false;
+            m.next = out[(size_t)(off + k - 1)];
+            m.pos += k;
+            m.have_block = false;
+            m.feed_off = off;
+            m.feed_len = k;
+            if (!m.adopted) spec_tokens_.fetch_add((uint64_t)k, std::memory_order_relaxed);
+            // A bonus EOS ends the request here, as dflash_generate does.
+            if (!m.job->req.ignore_eos && (m.next == cfg.eos_id || (cfg.eos_id2 >= 0 && m.next == cfg.eos_id2)))
+                if (emit(m, m.next)) m.next_emitted = true;
+        }
+    }
+    int handed = 0;
+    for (Member& m : members)
+        if (!m.done) { handoff(m); ++handed; }
+    model_->spec_group_end();
+    if (spec_group_trace())
+        fprintf(stderr, "[spec-group] end: %zu members, %d handed off, %d verifies, %d rows, %d kept; "
+                        "draft %.1f ms, join %.1f ms, verify %.1f ms\n",
+                members.size(), handed, trace_steps, trace_rows, trace_kept, trace_draft_ms, trace_join_ms,
+                trace_verify_ms);
 }
 
 void ContinuousBatchEngine::run_speculative(Job& job) {
@@ -360,6 +1033,11 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
 
     Qwen35Model::SpecHooks hooks;
     hooks.seq_id = job.seq_id;
+    hooks.temperature = job.req.temperature;
+    hooks.seed = job.req.seed;
+    hooks.top_k = job.req.top_k;
+    hooks.top_p = job.req.top_p;
+    hooks.ignore_eos = job.req.ignore_eos;
     hooks.on_tokens = [&](const int* tokens, int n) -> bool {
         for (int i = 0; i < n; i++) {
             const auto t_emit = std::chrono::steady_clock::now();
@@ -387,8 +1065,36 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
         }
         return !spec_interrupt_.load(std::memory_order_relaxed);
     };
+    hooks.prefill_start = job.req.prefill_start;
+    // The prompt's prefix-cache checkpoints, taken during the speculative prefill exactly as the
+    // ordinary prefill takes them, so the next turn of a conversation finds its prefix cached.
+    std::vector<int> ckpts;
+    std::vector<Qwen35Model::RecurrentStateSnapshot> snaps;
+    if (prefix_hit_spec_on() && prefix_cache_ && job.req.prefix_cache) {
+        for (int ckpt : job.req.cache_checkpoints)
+            if (ckpt > job.req.prefill_start && ckpt < prompt_len && ckpt % kv_->block_size() == 0)
+                ckpts.push_back(ckpt);
+        std::sort(ckpts.begin(), ckpts.end());
+        ckpts.erase(std::unique(ckpts.begin(), ckpts.end()), ckpts.end());
+        snaps.resize(ckpts.size());
+        hooks.ckpts = ckpts.data();
+        hooks.n_ckpts = (int)ckpts.size();
+        hooks.snaps = snaps.data();
+    }
     Qwen35Model::SpecResume r;
+    if (prefix_cache_) {   // its verify lookahead grows the session past the admission budget
+        std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+        prefix_cache_->evict_for(4);
+    }
     model_->dflash_generate(job.req.prompt, job.req.max_new_tokens, nullptr, nullptr, &hooks, &r);
+    if (r.ckpts_taken) {
+        for (size_t i = 0; i < ckpts.size(); ++i) {
+            Job::Checkpoint cp;
+            cp.pos = ckpts[i];
+            cp.state = std::move(snaps[i]);
+            job.checkpoints.push_back(std::move(cp));
+        }
+    }
     spec_running_.store(false, std::memory_order_relaxed);
     if (!r.engaged) return;   // nothing ran: ordinary prefill picks the job up on the next iteration
     spec_runs_.fetch_add(1, std::memory_order_relaxed);
@@ -407,7 +1113,8 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     };
     if (job.cancelled || job.timed_out) { finish(); return; }
     const int last = job.output.empty() ? -1 : job.output.back();
-    const bool hit_eos = last >= 0 && (last == cfg.eos_id || (cfg.eos_id2 >= 0 && last == cfg.eos_id2));
+    const bool hit_eos = last >= 0 && !job.req.ignore_eos &&
+                         (last == cfg.eos_id || (cfg.eos_id2 >= 0 && last == cfg.eos_id2));
     const bool hit_limit = job.decode_emitted >= job.req.max_new_tokens;
     if (r.failed || r.emitted != job.decode_emitted ||
         (!r.finished && !hit_eos && !hit_limit && r.position != prompt_len + job.decode_emitted)) {
@@ -432,6 +1139,13 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
 void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
     std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
     if (!prefix_cache_) prefix_cache_ = std::make_unique<PrefixCache>(kv_, limits);
+    model_->warm_snapshot_pool();   // a burst's checkpoint snapshots must not pin memory mid-step
+}
+
+void ContinuousBatchEngine::disable_prefix_cache() {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+    prefix_cache_.reset();
+    evictable_last_.store(0, std::memory_order_relaxed);
 }
 
 PrefixCache::Stats ContinuousBatchEngine::prefix_cache_stats() const {
@@ -454,6 +1168,20 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
     if (job.req.prompt.empty() || job.req.max_new_tokens <= 0) return fail(err);
     if ((int)job.req.prompt.size() + job.req.max_new_tokens > model_->config().max_seq)
         return fail(EnqueueError::BAD_REQUEST);
+    // Every id the forward will embed has to be a row of the embedding table. One that is not
+    // reads past it on the device -- an illegal address that loses the CUDA context and takes
+    // the whole server down for every client, where it should be one 400. Reachable from a
+    // server run with a tokenizer from another model (Qwen3.8's 248K ids against Muse Glimmer's
+    // 202K rows crashed on the first request) and from any embedding caller passing raw ids.
+    {
+        const int vocab = model_->config().vocab;
+        auto bad = [vocab](const std::vector<int>& ids) {
+            for (int t : ids) if (t < 0 || t >= vocab) return true;
+            return false;
+        };
+        if (vocab > 0 && (bad(job.req.prompt) || bad(job.req.forced_tokens)))
+            return fail(EnqueueError::BAD_REQUEST);
+    }
 
     const int cap = max_queue_depth_config();
     if (cap > 0) {
@@ -484,7 +1212,12 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
-            if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
+            // The prefix cache may be holding the room this turn needs: give it back first, as the
+            // automatic-cache branch below does.
+            if (!kv_->allocate(seq_id, budget) &&
+                !(prefix_cache_ && prefix_cache_->evict_for((budget + kv_->block_size() - 1) / kv_->block_size()) &&
+                  kv_->allocate(seq_id, budget)))
+                return fail(EnqueueError::OVERLOADED);
             model_->activate_session(seq_id);
             // The KV blocks survived the previous request, but its decoding advanced the hybrid
             // recurrent state past the prefix. Replay the end-of-prefix snapshot so the 48
@@ -507,8 +1240,10 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             PrefixCache::Hit hit;
             if (cache_eligible) hit = prefix_cache_->lookup(job.req.prompt);
             bool alloc_failed = false;
+            // A hit whose KV is on the host tier opens a plain session; the cache copies the KV in.
             auto open = [&](const PrefixCache::Hit& h) {
-                return model_->open_session(budget, &alloc_failed, h.tokens > 0 ? &h.blocks : nullptr);
+                return model_->open_session(budget, &alloc_failed,
+                                            h.tokens > 0 && !h.on_host ? &h.blocks : nullptr);
             };
             seq_id = open(hit);
             if (!seq_id && !alloc_failed && prefix_cache_) {
@@ -521,6 +1256,10 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
                 }
             }
             if (!seq_id) return fail(alloc_failed ? EnqueueError::ALLOC_FAILED : EnqueueError::OVERLOADED);
+            // The copy did not happen (the entry went, or the transfer failed): the session's blocks
+            // are its own, and the whole prompt is prefilled into them.
+            if (hit.tokens > 0 && hit.on_host && !prefix_cache_->restore_host_hit(hit, seq_id))
+                hit = PrefixCache::Hit{};
             if (hit.tokens > 0) {
                 if (model_->restore_recurrent_state(seq_id, hit.state)) {
                     job.req.prefill_start = hit.tokens;
@@ -550,8 +1289,38 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
 
     job.request_id = next_req_id_.fetch_add(1);
     job.seq_id = seq_id;
-    job.on_token = on_token;
-    job.on_token_logprob = on_token_logprob;
+    static const bool async_emit = [] {
+        const char* e = getenv("SPARKINFER_ASYNC_EMIT");
+        return !(e && e[0] == '0');
+    }();
+    if (async_emit && on_token) {
+        auto q = std::make_shared<Job::EmitQueue>();
+        q->user_token = on_token;
+        q->user_logprob = on_token_logprob;
+        job.emit = q;
+        job.on_token = [q](int t) {
+            std::lock_guard<std::mutex> g(q->mu);
+            if (q->stop) return false;
+            Job::EmitQueue::Event ev;
+            ev.token = t;
+            q->events.push_back(std::move(ev));
+            q->cv.notify_one();
+            return true;
+        };
+        if (on_token_logprob)
+            job.on_token_logprob = [q](const Qwen35Model::TokenLogprob& lp) {
+                std::lock_guard<std::mutex> g(q->mu);
+                if (q->stop) return;
+                Job::EmitQueue::Event ev;
+                ev.is_logprob = true;
+                ev.lp = lp;
+                q->events.push_back(std::move(ev));
+                q->cv.notify_one();
+            };
+    } else {
+        job.on_token = on_token;
+        job.on_token_logprob = on_token_logprob;
+    }
     job.prefill_pos = job.req.prefill_start;
     job.t_submit = std::chrono::steady_clock::now();
     auto ptr = std::make_unique<Job>(std::move(job));
@@ -565,6 +1334,52 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
 }
 
 ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t request_id) {
+    // Async emission: run the caller's callbacks here, on its own thread, as the worker queues
+    // them, until the job closes its queue. Never under mu_ or the queue's lock.
+    std::shared_ptr<Job::EmitQueue> q;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = jobs_.find(request_id);
+        if (it != jobs_.end()) q = it->second->emit;
+    }
+    size_t taken = 0, cut = 0;
+    if (q) {
+        bool stopped = false;
+        std::deque<Job::EmitQueue::Event> batch;
+        for (;;) {
+            bool closed = false;
+            {
+                std::unique_lock<std::mutex> lk(q->mu);
+                q->cv.wait_for(lk, std::chrono::milliseconds(100),
+                               [&] { return !q->events.empty() || q->closed; });
+                batch.swap(q->events);
+                closed = q->closed;
+            }
+            for (auto& ev : batch) {
+                if (stopped) continue;
+                if (ev.is_logprob) {
+                    if (q->user_logprob) q->user_logprob(ev.lp);
+                    continue;
+                }
+                ++taken;
+                if (!q->user_token(ev.token)) {
+                    stopped = true;
+                    cut = taken;
+                    std::lock_guard<std::mutex> g(q->mu);
+                    q->stop = true;
+                }
+            }
+            batch.clear();
+            if (closed) break;
+            // Belt and braces: a job finished by a path that did not close its queue.
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = jobs_.find(request_id);
+            if (it == jobs_.end() || it->second->done) {
+                std::lock_guard<std::mutex> g(q->mu);
+                if (q->events.empty()) break;
+            }
+        }
+    }
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [&] {
         auto it = jobs_.find(request_id);
@@ -585,6 +1400,14 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.decode_tps = it->second->decode_tps;
     out.cached_tokens = it->second->cached_tokens;
     jobs_.erase(it);
+    // The worker may have produced a token or two past the one the callback stopped on.
+    // The callback stopped the request, as it would have synchronously: whatever the worker reached
+    // after that (EOS, the token limit) is not what ended it.
+    if (cut > 0) {
+        if (out.tokens.size() > cut) out.tokens.resize(cut);
+        out.cancelled = true;
+        out.reached_token_limit = false;
+    }
     return out;
 }
 
@@ -607,9 +1430,19 @@ void ContinuousBatchEngine::worker_loop() {
         // capture on.
         {
             Job* spec_job = nullptr;
+            bool spec_group = false;
+            bool draft_offload = false;
+            bool draft_restore = false;
             {
                 std::lock_guard<std::mutex> lock(mu_);
-                if (speculative_ && running_) {
+                // SPARKINFER_SPECULATIVE=0 keeps the draft loaded (the same device memory, so the
+                // same prefill and decode paths) but decodes every request token by token: the
+                // reference a speculative launch must reproduce.
+                static const bool spec_env_on = [] {
+                    const char* e = getenv("SPARKINFER_SPECULATIVE");
+                    return !(e && e[0] == '0');
+                }();
+                if (speculative_ && running_ && spec_env_on) {
                     int live = 0;
                     Job* only = nullptr;
                     for (const auto& kv : jobs_) {
@@ -617,8 +1450,70 @@ void ContinuousBatchEngine::worker_loop() {
                         ++live;
                         only = kv.second.get();
                     }
-                    if (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
-                        only->prefill_pos == 0 && spec_eligible(only->req)) {
+                    // Concurrent speculation: no more live requests than a group takes, each a fresh,
+                    // eligible prompt -- or one already decoding that the group can adopt (it rides
+                    // the verify a row a step without a draft, see run_spec_group), as long as at
+                    // least one is fresh to speculate. Requiring every request to be fresh meant a
+                    // load that never drained (the next prompt arriving while others decode) never
+                    // formed a group again once one ended. SPARKINFER_SPEC_ADOPT=0 requires it.
+                    static const bool adopt_on = [] {
+                        const char* e = getenv("SPARKINFER_SPEC_ADOPT");
+                        return !(e && e[0] == '0');
+                    }();
+                    if (spec_group_max() > 1 && live >= 1 && live <= spec_group_max()) {
+                        bool all = true;
+                        int fresh = 0;
+                        for (const auto& kv : jobs_) {
+                            const Job& j = *kv.second;
+                            if (j.done) continue;
+                            // ...and one the join would take: it speculates at least 64 positions
+                            // inside the draft's context (spec_group_join's own test). Anything else
+                            // started a group only to be declined, and with requests decoding beside
+                            // it that cost each of them a state conversion and packed decode its graphs.
+                            const bool is_fresh = !j.spec_tried && j.phase == SeqPhase::PREFILL &&
+                                                  j.prefill_pos == j.req.prefill_start && spec_eligible(j.req) &&
+                                                  j.req.max_new_tokens >= 64 &&
+                                                  (int)j.req.prompt.size() + 64 <= model_->spec_group_reach();
+                            fresh += is_fresh;
+                            all = all && (is_fresh || (adopt_on && spec_adoptable(j)));
+                        }
+                        spec_group = all && fresh > 0;
+                    }
+                    // The draft's memory is the headroom concurrent serving needs (a 32-request burst
+                    // overran a 32 GB card by ~1 GB with it resident), and past a group's size
+                    // nothing reads it. Once the load has stayed there for a while, it goes to the
+                    // host; the first speculation after that brings it back (~0.1 s).
+                    // SPARKINFER_DRAFT_OFFLOAD_MS=-1 keeps it resident.
+                    static const long long offload_ms = [] {
+                        const char* e = getenv("SPARKINFER_DRAFT_OFFLOAD_MS");
+                        return e ? atoll(e) : 1000LL;
+                    }();
+                    if (live > std::max(1, spec_group_max())) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (!spec_over_) {
+                            spec_over_ = true;
+                            spec_over_since_ = now;
+                        } else if (offload_ms >= 0 &&
+                                   now - spec_over_since_ >= std::chrono::milliseconds(offload_ms)) {
+                            draft_offload = true;
+                            spec_over_since_ = now;   // a failed attempt waits another interval
+                        }
+                    } else {
+                        spec_over_ = false;
+                    }
+                    const bool want_spec =
+                        spec_group ||
+                        (live == 1 && !only->spec_tried && only->phase == SeqPhase::PREFILL &&
+                         only->prefill_pos == only->req.prefill_start && spec_eligible(only->req));
+                    if (want_spec && model_->dflash_draft_offloaded()) {
+                        // Bring it back outside mu_ (submits keep queueing jobs meanwhile; one that
+                        // opens a session waits on the device mutex for the ~0.1 s copy), then decide again.
+                        draft_restore = true;
+                        spec_group = false;
+                    }
+                    if (!draft_restore && !spec_group && live == 1 && !only->spec_tried &&
+                        only->phase == SeqPhase::PREFILL &&
+                        only->prefill_pos == only->req.prefill_start && spec_eligible(only->req)) {
                         spec_job = only;
                         // Raised under mu_, which submit_locked also holds: a request submitted from
                         // here on sees it and interrupts; one submitted before made live == 2.
@@ -626,6 +1521,34 @@ void ContinuousBatchEngine::worker_loop() {
                         spec_running_.store(true, std::memory_order_relaxed);
                     }
                 }
+            }
+            if (draft_restore) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (model_->dflash_draft_restore()) {
+                    fprintf(stderr, "[spec] draft back on the device (%.0f ms)\n",
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+                } else {
+                    // No room for it now: these requests decode token by token instead.
+                    std::lock_guard<std::mutex> lock(mu_);
+                    for (auto& kv : jobs_)
+                        if (!kv.second->done) kv.second->spec_tried = true;
+                    fprintf(stderr, "[spec] no room to bring the draft back yet; decoding without it\n");
+                }
+                continue;
+            }
+            if (draft_offload && !model_->dflash_draft_offloaded()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (const size_t b = model_->dflash_draft_offload())
+                    fprintf(stderr, "[spec] draft off the device: %.2f GB freed while more requests run "
+                                    "than speculation takes (%.0f ms)\n", (double)b / 1e9,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+            }
+            if (spec_group) {
+                run_spec_group();
+                cv_.notify_all();
+                continue;
             }
             if (spec_job) {
                 run_speculative(*spec_job);
@@ -708,7 +1631,10 @@ void ContinuousBatchEngine::worker_loop() {
         const bool mix_decode = !decode_ids.empty();
         // One packed forward for the whole decode batch when every row is eligible; otherwise the
         // original one-forward-per-sequence loop, unchanged.
-        if (!step_jobs_packed(decode_ids, any_finished)) {
+        std::vector<MixChunk> mix;
+        std::vector<uint64_t> unmixable;
+        if (mix_decode) pick_mixed_chunks(prefill_ids, (int)decode_ids.size(), mix, unmixable);
+        if (!step_jobs_packed(decode_ids, any_finished, mix.empty() ? nullptr : &mix)) {
             for (uint64_t id : decode_ids) {
                 Job* job = nullptr;
                 {
@@ -723,6 +1649,32 @@ void ContinuousBatchEngine::worker_loop() {
         // filling (see Scheduler::schedule). They run back to back on this thread, which is the
         // point: each one widens the next decode step, and a decode step's cost is almost all
         // fixed weight read.
+        // A mixed step already advanced the waiting prompts it could carry, with the decode rows
+        // riding along; the next steps carry them on (running them now would stall the decode
+        // batch again). A chunk that ended on a prefix-cache checkpoint snapshots it here, as
+        // step_job would have. Only the prefills a mixed step can never carry run now.
+        int mixed = 0;
+        for (const MixChunk& c : mix) mixed += c.done;
+        if (mixed > 0) {
+            for (const MixChunk& c : mix) {
+                Job& J = *c.job;
+                if (c.done <= 0 || J.phase != SeqPhase::PREFILL || !(prefix_cache_ && J.req.prefix_cache))
+                    continue;
+                const int n = (int)J.req.prompt.size();
+                bool at_ck = false;
+                for (int ck : J.req.cache_checkpoints)
+                    at_ck = at_ck || (ck == J.prefill_pos && ck < n && ck % kv_->block_size() == 0);
+                bool have = false;
+                for (const Job::Checkpoint& cp : J.checkpoints) have = have || cp.pos == J.prefill_pos;
+                if (at_ck && !have) {
+                    Job::Checkpoint cp;
+                    cp.pos = J.prefill_pos;
+                    if (model_->snapshot_recurrent_state(J.seq_id, cp.state))
+                        J.checkpoints.push_back(std::move(cp));
+                }
+            }
+            prefill_ids.swap(unmixable);
+        }
         step_prefills_packed(prefill_ids);
         for (uint64_t pid : prefill_ids) {
             Job* job = nullptr;
@@ -784,8 +1736,14 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
     // finish notifies cv_ -- and erase the Job while the worker was still inside the prefix-cache
     // insert and close_session above: a use-after-free that segfaulted the server in finish_job_impl
     // under concurrent load with the cache on. Nothing may touch j after this line.
+    std::shared_ptr<Job::EmitQueue> q = j.emit;   // j may be gone once done is set
     std::lock_guard<std::mutex> lock(mu_);
     j.done = true;
+    if (q) {
+        std::lock_guard<std::mutex> g(q->mu);
+        q->closed = true;
+        q->cv.notify_all();
+    }
 }
 
 // Packed decode: one forward for the whole decode batch.
@@ -804,7 +1762,247 @@ void ContinuousBatchEngine::finish_job_impl(Job& j) {
 // generation_config (temperature 1.0 on Qwen3.8), almost every server request then decoded one
 // forward per sequence: aggregate throughput stayed at single-stream speed at any concurrency.
 // A declined batch just falls back to the sequential loop.
-bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished) {
+// MIXED STEPS (SPARKINFER_MIXED_CHUNK=<tokens> per step, default 1024 and 4096 on an MoE model,
+// 0 = off). While requests decode and prompts wait, the decode step carries chunks of those
+// prompts in the same forward:
+// the decode rows ride the chunks' weight reads instead of stalling behind prefill passes of their
+// own. The step's prompt tokens are filled oldest prompt first, as vLLM fills its token budget --
+// one prompt at a time left the rest queued behind it, which is what set the TTFT tail at c16/c32.
+// A chunk that reaches its prompt's end takes the first token from the same pass. A prompt the
+// pass cannot finish (it wants logprobs, or a constraint shapes its first token) stops one token
+// short and step_job owns its seed; a chunk also stops at the next prefix-cache checkpoint, which
+// the worker snapshots once a step lands on it.
+void ContinuousBatchEngine::pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, int n_decode,
+                                              std::vector<MixChunk>& chunks,
+                                              std::vector<uint64_t>& unmixable) {
+    // An MoE model takes 4096. Its step's chunk routes to nearly every expert, so each mixed step
+    // streams the whole expert set whatever the chunk size: at 1024 tokens that was ~24 ms of
+    // grouped MoE GEMM per 1K prompt tokens, and fewer, larger steps carry the same prompts for a
+    // fraction of the weight traffic. Measured on Qwen3.6-35B-A3B UD-Q4_K_M, AIPerf chat (1024 /
+    // 256, distinct prompts): c16 1,355 -> 1,476, c32 1,523 -> 1,648 output tok/s; 8K prompts c16
+    // 556 -> 578; c4 (no mixing) unchanged. 8192 measured the same as 4096 with a slower first
+    // token. Dense models keep 1024.
+    static const int env_budget = [] {
+        const char* e = getenv("SPARKINFER_MIXED_CHUNK");
+        return e ? std::max(0, atoi(e)) : -1;
+    }();
+    const int budget = env_budget >= 0 ? env_budget
+                     : (model_ && model_->config().n_experts > 1 ? 4096 : 1024);
+    // At most this many prompts in one step (SPARKINFER_MIXED_PROMPTS).
+    static const int max_prompts = [] {
+        const char* e = getenv("SPARKINFER_MIXED_PROMPTS");
+        const int v = e ? atoi(e) : 8;
+        return v < 1 ? 1 : v;
+    }();
+    // A prompt with more than this left is a long prefill: one batched pass of its own runs it
+    // faster than budget-sized chunks would (8192-token prompts at c16/c32: -12% output tok/s
+    // chunked), and the scheduler already meters those one per iteration. Same knob and default
+    // as the scheduler's prefill_mix_max_tokens(); 0 mixes every length.
+    static const int long_prompt = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_MIX_MAX");
+        const int v = e ? atoi(e) : 2048;
+        return v >= 0 ? v : 2048;
+    }();
+    // A budget below this does not make a mixed step; and the smallest part of a prompt the budget
+    // is split down to (a prompt that fits whole is taken whole, however small).
+    static constexpr int kMinBudget = 128, kMinPart = 64;
+    chunks.clear();
+    unmixable.clear();
+    if (budget < kMinBudget || !model_) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Nothing is mixed while 8 or fewer requests are live. With a drafter that load is
+    // speculation's (worker_loop forms a group from fresh prompts and the requests decoding beside
+    // them); a prompt part-way through mixed steps is neither, so mixing there kept groups from
+    // forming (Poisson arrivals at 2 requests/s: mean latency 4.56 -> 5.76 s). Without one, a
+    // prompt's own pass beside a handful of decode rows is the faster first token: Qwen3.6 at c4
+    // TTFT p50 80 -> 148 ms mixed, since its whole 1K prompt is one ~35 ms pass.
+    {
+        int live = 0;
+        for (const auto& kv : jobs_) live += !kv.second->done;
+        if (live <= std::max(8, spec_group_max())) return;
+    }
+    // BURSTS (opt-in, SPARKINFER_MIXED_ROW_TOKENS=<tokens per decode row>, e.g. 256): fresh prompt
+    // tokens waiting beyond decode rows x that -- a load ramping up, or a wave arriving at once --
+    // take passes of SPARKINFER_MIXED_BURST_CHUNK tokens (default 4096) and up to 16 prompts, with
+    // the decode rows riding along, or with that at 0 the packed prefill. Budget-sized passes split
+    // a burst where one packed pass is cheaper: the continuous-batching bench (C streams of 256
+    // tokens arriving together) runs 3-9% fewer tok/s mixing every step than either rule (Bonsai-2
+    // c32 2,074 against 2,263). Off by default all the same: in AIPerf chat, mixing the first wave
+    // in budget-sized steps staggers when its prompts finish, so the waves that follow do not
+    // arrive at once -- TTFT p50 at c16 / c32 343-348 / 364-367 ms, against 635-1,058 with either
+    // rule, and request latency p50 at c32 6.0-6.1 s against 6.3-7.1.
+    static const int row_tokens = [] {
+        const char* e = getenv("SPARKINFER_MIXED_ROW_TOKENS");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    static const int burst_budget = [] {
+        const char* e = getenv("SPARKINFER_MIXED_BURST_CHUNK");
+        return e ? std::max(0, atoi(e)) : 4096;
+    }();
+    int step_budget = budget, step_prompts = max_prompts;
+    if (row_tokens > 0) {
+        long fresh = 0;
+        for (uint64_t id : prefill_ids) {
+            auto it = jobs_.find(id);
+            if (it == jobs_.end() || it->second->done) continue;
+            const Job& j = *it->second;
+            if (j.phase == SeqPhase::PREFILL && j.mixed_tokens == 0)
+                fresh += (long)j.req.prompt.size() - j.prefill_pos;
+        }
+        if (fresh > (long)n_decode * row_tokens) {
+            if (burst_budget < kMinBudget) return;
+            step_budget = std::max(budget, burst_budget);
+            step_prompts = std::max(max_prompts, 16);
+        }
+    }
+    int left = step_budget;
+    for (uint64_t id : prefill_ids) {
+        auto it = jobs_.find(id);
+        if (it == jobs_.end() || it->second->done) continue;
+        Job* j = it->second.get();
+        const Request& r = j->req;
+        if (j->phase != SeqPhase::PREFILL || j->seq_id == 0 || r.use_prefix_session ||
+            !r.vision_pos.empty() || !r.mrope_pos.empty() || !r.forced_tokens.empty() ||
+            !r.logit_bias.empty()) {
+            unmixable.push_back(id);
+            continue;
+        }
+        const int n = (int)r.prompt.size();
+        if (long_prompt > 0 && j->mixed_tokens == 0 && n - j->prefill_pos > long_prompt) {
+            unmixable.push_back(id);
+            continue;
+        }
+        const bool finishable = !r.logprobs && !r.constraint;
+        // Up to the next prefix-cache checkpoint step_job would snapshot, else the prompt's end
+        // (one token short of it for a prompt the pass cannot finish).
+        int limit = finishable ? n : n - 1;
+        if (prefix_cache_ && r.prefix_cache)
+            for (int ck : r.cache_checkpoints)
+                if (ck > j->prefill_pos && ck < limit && ck % kv_->block_size() == 0) limit = ck;
+        const int avail = limit - j->prefill_pos;
+        // Under 8 tokens to go: step_job's short-resume forward takes them (about one decode
+        // step). As a chunk they could leave a pass no 8-row alignment can fix, and an unaligned
+        // mixed pass runs every layer on the NVFP4 fallback (a 9-row step: 85 ms against 16-20
+        // for aligned ones up to 88 rows).
+        if (avail < 8) {
+            unmixable.push_back(id);
+            continue;
+        }
+        // Past the budget or the prompt count it waits a step.
+        if ((int)chunks.size() >= step_prompts) continue;
+        const int take = std::min(avail, left);
+        if (take < 1 || (take < avail && take < kMinPart)) continue;
+        MixChunk c;
+        c.job = j;
+        c.max = take;
+        c.finish = finishable && limit == n && take == avail;
+        chunks.push_back(c);
+        left -= take;
+    }
+}
+
+// One mixed step: the decode rows in `toks`.. plus `chunks`, rows + chunk tokens trimmed to a
+// multiple of 8 (the NVFP4 GEMMs' row granule, else the pass takes the slow unaligned arm on every
+// layer) off the chunks that do not finish their prompts where possible. False having changed
+// nothing when the model declines.
+bool ContinuousBatchEngine::run_mixed_chunks(const std::vector<int>& toks, const std::vector<int>& pos,
+                                             const std::vector<uint64_t>& seqs, std::vector<int>& out,
+                                             const Qwen35Model::PackedSampling* samp,
+                                             std::vector<MixChunk>& chunks) {
+    const int m = (int)toks.size();
+    const int k = (int)chunks.size();
+    std::vector<int> lens((size_t)k);
+    int total = m;
+    for (int c = 0; c < k; ++c) total += lens[(size_t)c] = chunks[(size_t)c].max;
+    std::vector<unsigned char> want((size_t)k);
+    for (int c = 0; c < k; ++c) want[(size_t)c] = chunks[(size_t)c].finish ? 1 : 0;
+    // The remainder comes off one chunk, whole: the latest one that stops short anyway, else the
+    // latest that finishes, which leaves its last few tokens to step_job (see pick_mixed_chunks:
+    // every chunk is 8+ tokens, so one always can). An unaligned pass would run every layer on
+    // the NVFP4 fallback, so a step that cannot align does not mix.
+    const int r = total % 8;
+    if (r > 0) {
+        int at = -1;
+        for (int pass = 0; pass < 2 && at < 0; ++pass)
+            for (int c = k - 1; c >= 0 && at < 0; --c)
+                if ((pass == 1 || !want[(size_t)c]) && lens[(size_t)c] > r) at = c;
+        if (at < 0) return false;
+        lens[(size_t)at] -= r;
+        want[(size_t)at] = 0;
+    }
+    std::vector<uint64_t> cs((size_t)k);
+    std::vector<const int*> ci((size_t)k);
+    std::vector<int> p0((size_t)k), seeds((size_t)k, -1), top_k((size_t)k);
+    std::vector<float> temp((size_t)k), top_p((size_t)k);
+    std::vector<unsigned long long> seed((size_t)k), step((size_t)k);
+    for (int c = 0; c < k; ++c) {
+        Job& J = *chunks[(size_t)c].job;
+        cs[(size_t)c] = J.seq_id;
+        ci[(size_t)c] = J.req.prompt.data() + J.prefill_pos;
+        p0[(size_t)c] = J.prefill_pos;
+        // step_job's arguments to sample_seed_token.
+        temp[(size_t)c] = J.req.temperature;
+        seed[(size_t)c] = (unsigned long long)J.req.seed;
+        step[(size_t)c] = (unsigned long long)J.decode_emitted;
+        top_k[(size_t)c] = J.req.top_k;
+        top_p[(size_t)c] = J.req.top_p;
+    }
+    Qwen35Model::PackedSampling cs_samp;
+    cs_samp.temperature = temp.data();
+    cs_samp.seed = seed.data();
+    cs_samp.step = step.data();
+    cs_samp.top_k = top_k.data();
+    cs_samp.top_p = top_p.data();
+    // Text-only prompts: clear the rotary decode offset, as step_job does before each.
+    model_->reset_mrope_offset();
+    // SPARKINFER_MIXED_TRACE=1: one line per mixed step (rows, each chunk's length and whether it
+    // finishes, wall time).
+    static const bool trace = [] {
+        const char* e = getenv("SPARKINFER_MIXED_TRACE");
+        return e && e[0] == '1';
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ran = model_->mixed_step_multi(toks.data(), pos.data(), seqs.data(), m, out.data(), samp,
+                                              k, cs.data(), ci.data(), p0.data(), lens.data(),
+                                              want.data(), seeds.data(), &cs_samp);
+    if (trace) {
+        int rows = m;
+        std::string cl;
+        for (int c = 0; c < k; ++c) {
+            rows += lens[(size_t)c];
+            cl += " " + std::to_string(lens[(size_t)c]) + (want[(size_t)c] ? "f" : "");
+        }
+        fprintf(stderr, "[mixed] %s %d rows (%d decode,%s) %.1f ms\n", ran ? "step" : "declined", rows, m,
+                cl.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    if (!ran) return false;
+    bool finished_any = false;
+    for (int c = 0; c < k; ++c) {
+        MixChunk& mc = chunks[(size_t)c];
+        Job& J = *mc.job;
+        J.prefill_pos += lens[(size_t)c];
+        J.mixed_tokens += lens[(size_t)c];
+        mc.done = lens[(size_t)c];
+        mc.finish = want[(size_t)c] != 0;
+        if (mc.finish) {
+            // As a packed prefill leaves a prompt: DECODE with its first token pending. A seed
+            // that did not come back fails the request on its next step_job, as step_job's own
+            // prefill would.
+            J.next_token = seeds[(size_t)c];
+            J.phase = SeqPhase::DECODE;
+            finished_any = true;
+        }
+    }
+    // The prefill's scratch memory is back: a request waiting on a failed allocation retries.
+    if (finished_any) cv_.notify_all();
+    return true;
+}
+
+bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
+                                             std::vector<MixChunk>* chunks) {
+    if (chunks)
+        for (MixChunk& c : *chunks) c.done = 0;
+    if (chunks && chunks->empty()) chunks = nullptr;
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_PACKED_DECODE");
         return !(e && e[0] == '0');
@@ -815,7 +2013,7 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     // more than never packing at all: measured on RTX 5090 / Qwen3.8-27B-NVFP4, aggregate went
     // 334.9 tok/s at concurrency 8 to 79.0 at 12 -- a 4.2x collapse one request past the cap.
     const int cap = Qwen35Model::max_packed_rows();
-    if ((int)ids.size() < 2) return false;
+    if ((int)ids.size() < (chunks ? 1 : 2)) return false;
     const Qwen35Config& cfg = model_->config();
 
     std::vector<Job*> jobs;
@@ -862,8 +2060,9 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
             any_finished = true;
             continue;
         }
-        const bool hit_eos = j->next_token == cfg.eos_id ||
-                             (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2);
+        const bool hit_eos = !j->req.ignore_eos &&
+                             (j->next_token == cfg.eos_id ||
+                              (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2));
         const bool hit_limit = j->decode_emitted >= j->req.max_new_tokens;
         if (hit_eos || hit_limit) {
             j->reached_token_limit = hit_limit && !hit_eos;
@@ -916,7 +2115,10 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         samp.top_k = top_k.data();
         samp.top_p = top_p.data();
         bool ok = false;
-        if (m >= 2)
+        // The first group carries the prompt chunks.
+        if (off == 0 && chunks) ok = run_mixed_chunks(toks, pos, seqs, out, any_sampled ? &samp : nullptr,
+                                                      *chunks);
+        if (!ok && m >= 2)
             ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
                                        any_sampled ? &samp : nullptr);
         if (!ok) {
@@ -943,6 +2145,36 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
 // logit_bias, a constraint, forced tokens, an image, prefix-cache work, or an exactly-512-token
 // prompt (which the batched pass keeps on bf16 GDN) -- takes step_job unchanged, and so does
 // every job in a pack the model declines.
+// The prefix-cache checkpoint a packed prefill takes for `j`: 0 for none, the row for exactly one,
+// -1 when the job's checkpoints need the one-prompt path (several of them, or one the pack cannot
+// place: it needs 16 tokens each side, and a block-aligned row strictly inside the prompt).
+int ContinuousBatchEngine::pack_checkpoint(const Job& j) const {
+    if (!(prefix_cache_ && j.req.prefix_cache) || j.req.cache_checkpoints.empty()) return 0;
+    static const bool pack_ckpt = [] {
+        const char* e = getenv("SPARKINFER_PACK_CHECKPOINTS");
+        return !(e && e[0] == '0');
+    }();
+    if (!pack_ckpt) return -1;
+    const int n = (int)j.req.prompt.size();
+    int row = 0, count = 0;
+    for (int ckpt : j.req.cache_checkpoints) {
+        if (ckpt <= 0 || ckpt >= n || ckpt % kv_->block_size() != 0) continue;
+        if (ckpt == row) continue;
+        row = ckpt;
+        ++count;
+    }
+    if (count == 0) return 0;
+    // A checkpoint under 16 tokens from the prompt's end -- a chat prompt's last turn boundary is
+    // usually ~12 tokens before it -- is taken a block earlier instead of sending the prompt down
+    // the one-prompt path: the next turn still matches the cached prefix up to it and recomputes
+    // one more block, where refusing kept every prompt of a burst out of the pack (Qwen3.6, 32
+    // concurrent 1K-token chat prompts: 19 against 33 requests/s packed).
+    const int bs = kv_->block_size();
+    while (n - row < 16 && row - bs >= 16) row -= bs;
+    if (count > 1 || row < 16 || n - row < 16) return -1;
+    return row;
+}
+
 void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_ids) {
     static const int pack_tokens = [] {
         const char* e = getenv("SPARKINFER_PREFILL_PACK_TOKENS");
@@ -963,7 +2195,7 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
                 j.cached_tokens == 0 && j.seq_id != 0 && !j.req.use_prefix_session &&
                 j.req.vision_pos.empty() && j.req.mrope_pos.empty() && j.req.forced_tokens.empty() &&
                 !j.req.logprobs && j.req.logit_bias.empty() && !j.req.constraint &&
-                !(prefix_cache_ && j.req.prefix_cache && !j.req.cache_checkpoints.empty());
+                pack_checkpoint(j) >= 0;
             if (plain && n >= 2 && n <= pack_tokens && n != 512) eligible.push_back(&j);
         }
     }
@@ -987,8 +2219,11 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
         std::vector<int> lens, seeds(pk.size(), -1), top_k;
         std::vector<float> temp, top_p;
         std::vector<unsigned long long> seed, step;
-        bool any_sampled = false;
+        std::vector<int> ckpt_rows;
+        bool any_sampled = false, any_ckpt = false;
         for (Job* j : pk) {
+            ckpt_rows.push_back(pack_checkpoint(*j));
+            any_ckpt = any_ckpt || ckpt_rows.back() > 0;
             sids.push_back(j->seq_id);
             prompts.push_back(j->req.prompt.data());
             lens.push_back((int)j->req.prompt.size());
@@ -1008,11 +2243,20 @@ void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_
         samp.top_p = top_p.data();
         // Text-only prompts: clear the rotary decode offset, exactly as step_job does before each.
         model_->reset_mrope_offset();
+        std::vector<Qwen35Model::RecurrentStateSnapshot> snaps(pk.size());
         if (!model_->ingest_prompts_packed(sids.data(), prompts.data(), lens.data(),
                                            (int)pk.size(), seeds.data(),
-                                           any_sampled ? &samp : nullptr))
+                                           any_sampled ? &samp : nullptr,
+                                           any_ckpt ? ckpt_rows.data() : nullptr,
+                                           any_ckpt ? snaps.data() : nullptr))
             continue;
         for (size_t k = 0; k < pk.size(); ++k) {
+            if (ckpt_rows[k] > 0 && snaps[k].host) {
+                Job::Checkpoint cp;
+                cp.pos = ckpt_rows[k];
+                cp.state = std::move(snaps[k]);
+                pk[k]->checkpoints.push_back(std::move(cp));
+            }
             pk[k]->prefill_pos = lens[k];
             pk[k]->next_token = seeds[k];
             pk[k]->phase = SeqPhase::DECODE;
@@ -1039,8 +2283,14 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         job.error = "CUDA context lost (unrecoverable device error) -- request aborted; "
                     "the server requires a restart";
         {
+            std::shared_ptr<Job::EmitQueue> q = job.emit;
             std::lock_guard<std::mutex> lock(mu_);   // done lets the waiting thread destroy the Job
             job.done = true;
+            if (q) {
+                std::lock_guard<std::mutex> g(q->mu);
+                q->closed = true;
+                q->cv.notify_all();
+            }
         }
         cv_.notify_all();
         return true;
@@ -1197,7 +2447,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
             seed = model_->ingest_prompt_range(job.req.prompt.data(), pos, n, chunk_limit, &out_pos,
                                                want_seed_logprob,
                                                /*allow_batched_resume=*/pos > 0 &&
-                                                   (pos != job.prefill_pos || job.cached_tokens > 0));
+                                                   (pos != job.prefill_pos || job.cached_tokens > 0 ||
+                                                    job.mixed_tokens > 0));
         }
         if (has_vision) model_->clear_pending_vision();
         // Positions are consumed by the prefill they were staged for; the offset is not cleared
@@ -1288,7 +2539,7 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
 
     // EOS never ends a teacher-forced score: the caller asked about a specific token sequence and
     // is owed a logprob for every token in it, even if it contains an end marker.
-    const bool hit_eos = job.req.forced_tokens.empty() &&
+    const bool hit_eos = job.req.forced_tokens.empty() && !job.req.ignore_eos &&
                          (job.next_token == cfg.eos_id ||
                           (cfg.eos_id2 >= 0 && job.next_token == cfg.eos_id2));
     const bool hit_token_limit = job.decode_emitted >= job.req.max_new_tokens;

@@ -160,6 +160,9 @@ struct ModelEngine::Impl {
 
     // Automatic prefix cache: see ModelEngine::set_prefix_cache_boundary_token.
     bool prefix_cache_on = false;
+    sparkinfer::PrefixCache::Limits prefix_limits;   // as enabled; max_blocks re-derived on growth
+    int prefix_kv_pct = 75;
+    size_t kv_budget_per_block = 0;                  // load()'s bf16-denominated pool_bytes / block
     int prefix_cache_boundary_token = -1;
     int prefix_cache_min_tokens = 1024;
 
@@ -281,19 +284,13 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     kvc.head_dim = impl_->cfg.head_dim;
     kvc.block_size = 16;
     { const char* e = getenv("SPARKINFER_KV_INT8");
-      // Muse Glimmer: int8 KV cache is a confirmed correctness bug, not a precision tradeoff --
-      // incoherent output from the very first decode token (#779), root-caused to its per-layer
-      // sliding-window/NoPE alternation + sandwich-norm activations not matching what the int8
-      // quantize/dequantize kernels were tuned against (Qwen3.6, same cfg.hybrid=true, is
-      // unaffected). The CLI tools never caught this because their short eval prompts (<4096
-      // tokens) always fell under the bf16 threshold below; the server activates int8 off its
-      // configured max_seq (there's no per-request length at KV-pool-init time), and the default
-      // max_seq (4096) satisfies ">=4096" unconditionally, so every default-config Muse Glimmer
-      // server silently served garbage. Default to bf16 until the kernel bug itself is fixed;
-      // SPARKINFER_KV_INT8=1 still force-enables it for anyone debugging that fix.
+      // Muse Glimmer was held on bf16 KV after #779 (garbage from the first decode token). The cause
+      // was the int8 pool receiving bf16 writes, fixed in #1006; the carve-out outlived it and kept
+      // Muse's pool at half the tokens. Measured on Muse Glimmer 30B Q4_K_M, 6,200 tokens of real
+      // text teacher-forced (qwen3_gguf_score, SPARKINFER_SCORE_MAX_SEQ=8192): perplexity 15.365
+      // bf16 against 15.368 int8, top-1 0.4589 / 0.4591. SPARKINFER_KV_INT8=0 keeps bf16.
       kvc.int8_kv = e ? (e[0] != '0')
-                      : (impl_->cfg.muse_glimmer ? false
-                         : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+                      : (impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
     // Only the full-attention layers get a pool slot. The Gated-DeltaNet layers of a hybrid model
     // carry a recurrent state and never read paged KV, so a slot for them is pure waste -- on
     // Qwen3.8-27B that is 16 slots of 64, i.e. the pool was 4x larger than the model can use.
@@ -312,8 +309,9 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // is correct as written -- it must stay even when int8_kv is on, or capacity halves. What has
     // to match kvc.layer_slot is the SLOT COUNT: passing n_layers while the manager counts 16
     // slots would hand out 4x the blocks for the same memory rather than shrinking the pool.
+    impl_->kv_budget_per_block = (size_t)kvL * 2 * epb * 2;
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
-        kvc, (size_t)kvL * 2 * epb * 2 * blocks);
+        kvc, impl_->kv_budget_per_block * blocks);
 
     // Reports the slot count actually used, and the resident bytes rather than the bf16 budget --
     // the old line multiplied by n_layers (all 64) and by 2 regardless of int8, so it overstated
@@ -407,22 +405,44 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
         };
         const char* on = getenv("SPARKINFER_PREFIX_CACHE");
         const bool wanted = !(on && on[0] == '0');
-        if (wanted && sparkinfer::deterministic_mode()) {
+        // SPARKINFER_PREFIX_CACHE=1 keeps it on under SPARKINFER_DETERMINISTIC=1, for a check that
+        // replays the same request sequence on several launches and so the same cache hits.
+        const bool forced = on && on[0] == '1';
+        if (wanted && !forced && sparkinfer::deterministic_mode()) {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_DETERMINISTIC=1 -- a "
                             "request's output may not depend on what earlier requests cached)\n");
         } else if (wanted) {
             sparkinfer::PrefixCache::Limits lim;
-            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 32));
-            lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", 8192)) << 20;
-            lim.max_blocks = impl_->kv->num_total_blocks() / 2;
+            // Sized by memory, not by a count: a quarter of the machine's RAM (8-32 GB) for the
+            // recurrent-state snapshots and three quarters of the KV pool for the blocks, with the
+            // cache evicted least-recently-used on demand when a request needs the room. A count
+            // of 32 and half the pool held ~32 chat prompts: AIPerf chat at 32 concurrent ran 971
+            // tok/s with TTFT p50 1,575 ms, and 1,222 tok/s / 1,378 ms with room for 62.
+            const long long ram_mb = (long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE) >> 20;
+            const long long host_mb = std::max(8192LL, std::min(32768LL, ram_mb > 0 ? ram_mb / 4 : 8192LL));
+            lim.max_entries = (size_t)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_ENTRIES", 256));
+            lim.max_host_bytes = (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_MB", host_mb)) << 20;
+            const long long kv_pct =
+                std::max(1LL, std::min(100LL, env_int("SPARKINFER_PREFIX_CACHE_KV_PCT", 75)));
+            lim.max_blocks = (int)((long long)impl_->kv->num_total_blocks() * kv_pct / 100);
+            // Host KV tier: entries pushed off the device keep their KV in pinned host memory, a
+            // quarter of RAM up to 16 GB by default (~60 8K-token prompts on Qwen3.8-27B). The
+            // device pool holds one --ctx worth of tokens, a handful of long prompts.
+            // SPARKINFER_PREFIX_CACHE_HOST_KV_MB=0 turns it off.
+            const long long host_kv_mb = std::min(16384LL, ram_mb > 0 ? ram_mb / 4 : 0LL);
+            lim.max_host_kv_bytes =
+                (size_t)std::max(0LL, env_int("SPARKINFER_PREFIX_CACHE_HOST_KV_MB", host_kv_mb)) << 20;
             impl_->prefix_cache_min_tokens =
                 (int)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_MIN_TOKENS", 1024));
             impl_->batch_engine->enable_prefix_cache(lim);
             impl_->prefix_cache_on = true;
+            impl_->prefix_limits = lim;
+            impl_->prefix_kv_pct = (int)kv_pct;
             fprintf(stderr, "[sparkinfer-server] prefix cache: on (%zu entries, %zu MiB host, %d of %d "
-                            "KV blocks, checkpoints from %d tokens)\n",
+                            "KV blocks, %zu MiB host KV tier, checkpoints from %d tokens)\n",
                     lim.max_entries, lim.max_host_bytes >> 20, lim.max_blocks,
-                    impl_->kv->num_total_blocks(), impl_->prefix_cache_min_tokens);
+                    impl_->kv->num_total_blocks(), lim.max_host_kv_bytes >> 20,
+                    impl_->prefix_cache_min_tokens);
         } else {
             fprintf(stderr, "[sparkinfer-server] prefix cache: off (SPARKINFER_PREFIX_CACHE=0)\n");
         }
@@ -847,6 +867,59 @@ int ModelEngine::max_queue_depth() const {
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
 }
 
+void ModelEngine::grow_kv_pool() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!impl_->ready || !impl_->kv || !impl_->batch_engine || !impl_->kv_budget_per_block) return;
+    const char* on = getenv("SPARKINFER_KV_GROW");
+    if (on && on[0] == '0') return;
+    // The LMCache sidecar was handed the pool's layout at load; leave a pool it knows alone.
+    if (impl_->lmcache_bridge) return;
+    const char* he = getenv("SPARKINFER_KV_HEADROOM_GIB");
+    // Muse Glimmer leaves 4 GiB, not 6. Its headroom is taken by the NVFP4 down / o copies the
+    // prefill builds beside its first pass (~4.5 GB when there is room), which buy little: with 4
+    // GiB they keep 39 of 52 downs and 1 o, 8K prompts at 4 requests prefill exactly as fast (196
+    // tok/s), and the pool holds 151K tokens instead of 72K -- every request of 16 x 8K fits. AIPerf
+    // 8K prompts at 16 requests: 281 -> 351 tok/s, TTFT p50 9.7 -> 2.5 s; chat cells unchanged.
+    const double head_gib = he ? atof(he) : (impl_->cfg.muse_glimmer ? 4.0 : 6.0);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    const size_t head_b = (size_t)(head_gib * (double)(1ull << 30));
+    const int cur_blocks = impl_->kv->num_total_blocks();
+    const size_t cur_res = impl_->kv->resident_bytes();
+    if (free_b <= head_b || cur_blocks <= 0 || !cur_res) return;
+    // Resident bytes per block, block tables included (they scale with the pool too).
+    const double per_block = (double)cur_res / (double)cur_blocks;
+    const long long add = (long long)((double)(free_b - head_b) / per_block);
+    // Not worth re-sizing for crumbs; and stay well inside the int block ids.
+    if (add < cur_blocks / 8) return;
+    const long long want = std::min<long long>((long long)cur_blocks + add, 1LL << 22);
+    // The prefix cache holds the pool's layout and a share of its blocks: rebuild it around the
+    // new pool. Nothing has been cached yet -- this runs before the first request.
+    if (impl_->prefix_cache_on) impl_->batch_engine->disable_prefix_cache();
+    bool ok = impl_->kv->resize_idle(impl_->kv_budget_per_block * (size_t)want);
+    if (!ok) {
+        fprintf(stderr, "[sparkinfer-server] kv_cache: growing to %lld blocks failed; keeping %d\n",
+                want, cur_blocks);
+        if (!impl_->kv->resize_idle(impl_->kv_budget_per_block * (size_t)cur_blocks))
+            fprintf(stderr, "[sparkinfer-server] kv_cache: could not restore the pool\n");
+    }
+    if (impl_->prefix_cache_on) {
+        sparkinfer::PrefixCache::Limits lim = impl_->prefix_limits;
+        lim.max_blocks = (int)((long long)impl_->kv->num_total_blocks() * impl_->prefix_kv_pct / 100);
+        impl_->batch_engine->enable_prefix_cache(lim);
+        impl_->prefix_limits = lim;
+    }
+    size_t free_after = 0;
+    cudaMemGetInfo(&free_after, &total_b);
+    const int bs = impl_->kv->block_size();
+    fprintf(stderr, "[sparkinfer-server] kv_cache grown: %d -> %d blocks (%lld -> %lld tokens), "
+                    "resident %.1f GiB, %.1f GiB left free (SPARKINFER_KV_HEADROOM_GIB=%.1f)\n",
+            cur_blocks, impl_->kv->num_total_blocks(), (long long)cur_blocks * bs,
+            (long long)impl_->kv->num_total_blocks() * bs,
+            (double)impl_->kv->resident_bytes() / (double)(1ull << 30),
+            (double)free_after / (double)(1ull << 30), head_gib);
+}
+
 bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     std::lock_guard<std::mutex> lock(mu_);
     if (!impl_->ready || !impl_->model || !impl_->batch_engine) {
@@ -857,24 +930,46 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
         err = "speculative decoding is supported for Qwen3.8-27B targets only";
         return false;
     }
+    // The context a request may speculate through. A draft whose every layer attends a sliding
+    // window keeps window-sized slots (#1243), so it follows the target's whole context at no extra
+    // memory; capping it at 16384 left every longer prompt on plain decode (prose at 16K / 32K /
+    // 64K tokens: 96 / 93 / 86 tok/s against 200 / 173 / 132 speculating). Any other draft's slots
+    // grow with this, and keep the 16384 default. SPARKINFER_DSPARK_MAX_CTX overrides.
     const char* e = getenv("SPARKINFER_DSPARK_MAX_CTX");
+    const int dflt = sparkinfer::DFlashDraftModel::windowed_slots(dir) ? impl_->cfg.max_seq : 16384;
     sparkinfer::DFlashDraftConfig dcfg;
-    dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : 16384);
+    dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : dflt);
     auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
     if (!draft->load(dir)) {
         // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for
         // the whole --ctx before the draft loads, and at --ctx 262144 a 32 GB card has no room
         // left for it (#1086).
-        err = "cannot load a DSpark draft from " + dir + " at --ctx " +
+        err = "cannot load a draft from " + dir + " at --ctx " +
               std::to_string(impl_->cfg.max_seq) +
               " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
     }
+    // Build the quantized copies now rather than at the first speculative request: for DFlash2
+    // that releases the 2.7 GB bf16 MLP before any request needs the room, instead of holding it
+    // until something speculates -- forever, on a server whose load never drops to a group --
+    // and it moves the ~1 GB transient of building them from the middle of serving to load.
+    draft->ensure_quant();
+    // One round trip through host memory now: it pins the host buffer at load (pinning stalls
+    // every thread's CUDA calls, so not mid-serving) and proves the draft can step off the device
+    // before a busy server relies on it. Contents return at the same addresses, bit for bit.
+    if (const size_t b = draft->offload()) {
+        if (!draft->restore()) {
+            err = "the draft left the device for its load-time check and could not come back";
+            return false;
+        }
+        fprintf(stderr, "[sparkinfer-server] draft can step off the device under load (%.2f GB)\n",
+                (double)b / 1e9);
+    }
     impl_->model->set_dflash_draft(draft.get());
     impl_->draft = std::move(draft);
     impl_->batch_engine->enable_speculative(true);
-    fprintf(stderr, "[sparkinfer-server] speculative decoding: DSpark draft %s (block %d, draft context %d)\n",
-            dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
+    fprintf(stderr, "[sparkinfer-server] speculative decoding: %s draft %s (block %d, draft context %d)\n",
+            impl_->draft->config().dflash2 ? "DFlash2" : "DSpark", dir.c_str(), impl_->draft->config().block_size, impl_->draft->config().max_seq);
     return true;
 }
 
@@ -915,6 +1010,10 @@ ModelEngine::PrefixCacheStats ModelEngine::prefix_cache_stats() const {
     out.entries = s.entries;
     out.host_bytes = s.host_bytes;
     out.blocks = s.blocks;
+    out.host_hits = s.host_hits;
+    out.demotions = s.demotions;
+    out.host_entries = s.host_entries;
+    out.host_kv_bytes = s.host_kv_bytes;
     return out;
 }
 
@@ -940,11 +1039,13 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
                                                      on_token_logprob,
                                                  const std::vector<int>& forced_tokens,
                                                  const PreparedImages* images,
-                                                 std::shared_ptr<sparkinfer::TokenConstraint> constraint) {
+                                                 std::shared_ptr<sparkinfer::TokenConstraint> constraint,
+                                                 bool ignore_eos) {
     CompletionResult out;
     sparkinfer::ContinuousBatchEngine::Request req;
     req.prompt = prompt_ids;
     req.max_new_tokens = max_new_tokens;
+    req.ignore_eos = ignore_eos;
     req.forced_tokens = forced_tokens;
     if (images && !images->mrope_pos.empty()) {
         // Carried whenever the checkpoint declares an mrope_section, independently of whether this

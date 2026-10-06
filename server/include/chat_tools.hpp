@@ -157,7 +157,10 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
 struct RequestControls {
     bool stream = false;
     bool include_usage = false;
-    int max_tokens = 256;
+    // 0 = the request set neither max_tokens nor max_completion_tokens: the server generates until
+    // the model stops, up to its output cap (#1088). A non-zero default here made every such request
+    // look like it had asked for 256, and they were all cut off there.
+    int max_tokens = 0;
     std::vector<std::string> stop;
     // <= 0 (default) is plain greedy argmax, byte-identical to pre-sampling behavior.
     float temperature = 0.f;
@@ -180,6 +183,9 @@ struct RequestControls {
     // loops that top_k/top_p already reach but logprobs/top_logprobs do not.
     float presence_penalty = 0.f;
     float frequency_penalty = 0.f;
+    // ignore_eos (vLLM / llama.cpp extension): generate max_tokens whatever the model emits, for
+    // benchmarks that want a fixed output length.
+    bool ignore_eos = false;
     // logprobs=false (default) attaches no logprobs field anywhere in the response. top_logprobs
     // is only meaningful when logprobs is true -- unlike top_k/top_p, this IS cross-validated
     // against a sibling field: parse_request_controls rejects top_logprobs supplied without

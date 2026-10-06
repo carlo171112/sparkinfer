@@ -13,6 +13,7 @@
 
 #include "qwen35_prefill.h"
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/kernels/prefill_ptq1_fp4.h"
 #include "sparkinfer/ternary_ptq1.h"
 #include "sparkinfer/kernels/hadamard.h"
@@ -29,6 +30,7 @@
 #include "sparkinfer/kernels/gemm.h"
 #include "sparkinfer/kernels/prefill_i8.h"
 #include "sparkinfer/kernels/prefill_fp8.h"
+#include "sparkinfer/kernels/prefill_quant_rows.h"
 #include "sparkinfer/kernels/prefill_gemm_skinny.h"
 #include "sparkinfer/kernels/prefill_moe.h"
 #include "sparkinfer/kernels/deterministic.h"
@@ -70,7 +72,13 @@ inline void pf_cu(cudaError_t e, const char* what) {
 // string's address rather than the formatted text on purpose: several of these carry a position
 // or layer index that moves every step, so deduplicating on the text would suppress nothing and
 // grow without bound.
-__attribute__((format(printf, 1, 2))) void verify_decline(const char* fmt, ...) {
+// MSVC has no format attribute; gcc and clang still check every call's arguments.
+#if defined(__GNUC__) || defined(__clang__)
+#define SI_VERIFY_DECLINE_FMT __attribute__((format(printf, 1, 2)))
+#else
+#define SI_VERIFY_DECLINE_FMT
+#endif
+SI_VERIFY_DECLINE_FMT void verify_decline(const char* fmt, ...) {
     static std::mutex mu;
     static std::vector<const char*> seen;
     {
@@ -89,6 +97,7 @@ struct Arena {
     std::vector<void*> bufs;
     std::vector<size_t> sizes;
     size_t cursor = 0;
+    size_t used = 0;   // bytes this call has asked for (since the last rewind)
     bool ok = true;
     // Advances whenever a buffer this arena handed out is freed. Anything that kept one of its
     // pointers past a call -- the whole-prefill CUDA graph -- is stale once this has moved.
@@ -96,6 +105,7 @@ struct Arena {
     template <class T> T* alloc(size_t n) {
         if (n == 0) n = 1;
         const size_t bytes = n * sizeof(T);
+        used += bytes;
         void* p = nullptr;
         if (cursor < bufs.size() && sizes[cursor] >= bytes) {
             p = bufs[cursor++];
@@ -113,7 +123,7 @@ struct Arena {
         ++cursor;
         return static_cast<T*>(p);
     }
-    void rewind() { cursor = 0; ok = true; }
+    void rewind() { cursor = 0; used = 0; ok = true; }
     void free_all() {
         if (!bufs.empty()) ++gen;
         for (void* b : bufs) cudaFree(b);
@@ -302,9 +312,19 @@ VerifyGraphCache& verify_graph_cache() {
     static thread_local VerifyGraphCache cache;
     return cache;
 }
+// An eager pass (verify_eager) gets its own arena. The arena hands out buffers by cursor position,
+// and a non-packed pass allocates a different sequence of them than a packed one, so sharing the
+// packed decode's arena re-allocated the buffers its cached graphs point at -- and the next packed
+// step launched a graph into freed memory (a segfault in cudaGraphLaunch under load). The
+// speculative path never hit this because it flushes the graphs whenever it runs.
+VerifyGraphCache& verify_eager_cache() {
+    static thread_local VerifyGraphCache cache;
+    return cache;
+}
 } // namespace
 
 void dflash_release_verify_cache() {
+    verify_eager_cache().arena.free_all();
     VerifyGraphCache& cache = verify_graph_cache();
     for (int t = 1; t <= kVerifyMaxRows; ++t) {
         if (cache.exec[t]) cudaGraphExecDestroy(cache.exec[t]);
@@ -392,21 +412,59 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (multi) {
         // Muse's attention branch loops its prompts itself, on either cache dtype; every other
         // stack takes the int8 per-prompt loop further down.
-        if (pos0 != 0 || moe || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
+        // The routed FFN is row-wise, so a pack's rows need nothing of it the one-prompt pass does
+        // not already do: an MoE stack packs as a mixed step's chunks and, with no decode rows
+        // beside them, as a burst of fresh prompts (ingest_prompts_packed).
+        // SPARKINFER_PACK_MOE=0 keeps the latter to one pass per prompt.
+        static const bool pack_moe = [] {
+            const char* e = getenv("SPARKINFER_PACK_MOE");
+            return !(e && e[0] == '0');
+        }();
+        if (pos0 != 0 || (moe && s.mix_n <= 0 && !pack_moe) || (!c.muse_glimmer && !s.kv->int8_kv()))
+            return -1;
         if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0) return -1;
-        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || !s.multi_seed) return -1;
+        if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || (!s.multi_seed && !s.multi_no_seed))
+            return -1;
+        // Segments resuming mid-prompt, or following decode rows, are a mixed step's chunks: no
+        // checkpoints inside them (the two-part conv path stages through the one shared buffer),
+        // and nothing but the int8, dense, non-Muse path the mixed rows run on.
+        bool resumed = false;
+        for (int i = 0; s.multi_pos0 && i < nseg; ++i) {
+            if (s.multi_pos0[i] < 0) return -1;
+            resumed = resumed || s.multi_pos0[i] > 0;
+        }
+        if ((resumed || s.mix_n > 0) && (c.muse_glimmer || s.multi_ckpt_row)) return -1;
         // Recurrent state only where the stack has Gated-DeltaNet layers to carry it.
         const bool linear = c.hybrid && !c.muse_glimmer;
         if (linear && (!s.multi_lin_state || !s.multi_lin_conv)) return -1;
         // Past this the pass switches to its long-context arms (the attention-norm deferral below),
         // which a pack of short prompts has no business taking.
         if (n >= 16384) return -1;
-        long rows = 0;
+        long rows = std::max(0, s.mix_n);   // a mixed step's chunks follow its decode rows
         for (int i = 0; i < nseg; ++i) {
             if (s.multi_len[i] <= 0 || s.multi_off[i] != rows) return -1;
             rows += s.multi_len[i];
         }
         if (rows != n) return -1;
+    }
+    // A mixed step: mix_n packed decode rows ahead of the chunk (Qwen35PrefillCtx::mix_n). The
+    // decode rows' kernels are packed decode's Qwen3.8 ones, so refuse anything else here, before
+    // the first kernel runs.
+    const int R = s.mix_n;
+    if (R < 0) return -1;
+    if (R > 0) {
+        // The decode rows' head: Q4_K, or the Q6_K / Q8_0 heads launch_mmvq_rows_f32 serves at
+        // these widths (Qwen3.6's GGUF head). The MoE FFN is row-wise like the dense one, so the
+        // decode rows take the prompt's routed experts the way the prompt rows do.
+        const bool head_ok = s.w.lm_head_type == 12 ||
+                             ((s.w.lm_head_type == 14 || s.w.lm_head_type == 8) &&
+                              (c.hidden == 2048 || c.hidden == 4096));
+        if (c.muse_glimmer || !s.kv->int8_kv() || s.kv->windowed() ||
+            s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0 ||
+            R >= n || !s.mix_rows || !s.mix_btab || !s.mix_pos || !s.mix_seq ||
+            !s.mix_lin_state || !s.mix_lin_conv || s.mix_splits < 1 || !s.mix_fa ||
+            !s.mix_q81 || !s.mix_logits || !s.mix_d_out || !s.mix_out || !head_ok)
+            return -1;
     }
 
     const int H = c.hidden;
@@ -418,14 +476,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // layer loop would leave the Gated-DeltaNet state advanced for the layers already done and not
     // for the rest, and nothing downstream can tell that apart from a clean state or undo it.
     if (pos0 < 0) return -1;
-    if (pos0 != 0) {
-        // Muse used to refuse here because its rolling-window attention took the window and the
-        // causal bound from the LOCAL row index, which is only the sequence position on a pass
-        // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute
-        // position, so a windowed ingest is exact -- and above prefill_single_pass_max_tokens()
-        // that is the difference between the batched path and the token loop for the WHOLE prompt.
-        if (s.capture_dst && s.capture_layers && s.n_capture > 0) return -1;  // DSpark capture rows
-    }
+    // Muse used to refuse pos0 != 0 here because its rolling-window attention took the window and
+    // the causal bound from the LOCAL row index, which is only the sequence position on a pass
+    // that starts at zero. Both Muse kernels now take q_pos0 and mask on the absolute position, so
+    // a windowed ingest is exact -- and above prefill_single_pass_max_tokens() that is the
+    // difference between the batched path and the token loop for the WHOLE prompt. A DSpark
+    // hidden-state capture refused it too; it now writes each row at its sequence position.
 
     // A pass that starts at position zero must start its recurrent GDN state from zero,
     // just like forward_token(position=0). Session buffers come from cudaMalloc and may reuse pages
@@ -438,6 +494,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (multi && s.multi_lin_state && s.multi_lin_conv) {
         for (int i = 0; i < nseg; ++i) {
             if (!s.multi_lin_state[i] || !s.multi_lin_conv[i]) continue;
+            if (s.multi_pos0 && s.multi_pos0[i] > 0) continue;   // resumes: its state carries in
             pf_cu(cudaMemsetAsync(
                       s.multi_lin_state[i], 0,
                       (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
@@ -585,7 +642,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_PREFILL_ARENA_REUSE");
         return !(e && e[0] == '0');
     }();
-    constexpr size_t kArenaKeepBytes = 1ull << 30;
+    // 2 GB, not 1: an MoE model's mixed steps carry up to 4096 prompt tokens (pick_mixed_chunks),
+    // and Qwen3.6-35B-A3B's scratch for one is up to ~1.8 GB. At 1 GB, 130 of 461 passes in an
+    // AIPerf chat c32 run gave every arena back and the next pass cudaMalloc'd it all again --
+    // ~1,800 cudaFree calls, each a device-wide sync, inside the mixed steps' GPU idle. 2 GB keeps
+    // it: chat c16 / c32 1,464 / 1,648 -> 1,485 / 1,657 tok/s. SPARKINFER_PREFILL_ARENA_KEEP_MB
+    // moves the limit; SPARKINFER_PREFILL_ARENA_DEBUG=1 logs each pass's held/used scratch.
+    static const size_t kArenaKeepBytes = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_KEEP_MB");
+        const long long v = e ? atoll(e) : 2048;
+        return (size_t)(v > 0 ? v : 2048) << 20;
+    }();
+    static const bool arena_dbg = getenv("SPARKINFER_PREFILL_ARENA_DEBUG") != nullptr;
     static thread_local Arena keep_a, keep_a8, keep_am, keep_aw;   // held across calls
     Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
     if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
@@ -642,7 +710,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // A pass that takes prefix-cache checkpoints copies state out mid-pass, into buffers that are
     // the request's own: it runs eager too.
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0 &&
-                          !multi && s.ckpt_n == 0;
+                          !multi && s.ckpt_n == 0 && R == 0;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
@@ -667,7 +735,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         keep_a.gen == g_pfb_arena_gen[0] && keep_a8.gen == g_pfb_arena_gen[1] &&
         keep_am.gen == g_pfb_arena_gen[2] && keep_aw.gen == g_pfb_arena_gen[3] &&
         kernels::prefill_scratch_epoch() == g_pfb_scratch_epoch;
-    if (g_pfb_exec && (multi || !graph_keys_match || !graph_scratch_unmoved)) {
+    // A packed pass of fresh prompts drops it as it always has; a mixed step's chunks (R > 0) run
+    // eager beside it every step and must not throw away the one-prompt graph each time.
+    if (g_pfb_exec && ((multi && R == 0) || !graph_keys_match || !graph_scratch_unmoved)) {
         cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
@@ -723,6 +793,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // appears only on some calls would shift every later allocation's index and make each pass
     // free and re-cudaMalloc the whole chain. `cconv` below is what decides zeros vs carry-in.
     bf16* cprev = a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv);
+    // One more per extra GDN segment stream, for a mixed step's chunks that resume mid-prompt:
+    // each copies its own session's window in on its own stream. Unconditional for the same reason.
+    bf16* cprev_seg[3] = { cprev,
+                           a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv),
+                           a.alloc<bf16>((size_t)(c.linear_conv_kernel - 1) * lqkv) };
     // At pos0 == 0 the conv genuinely starts from zeros -- pass nullptr and the kernels take
     // exactly the arithmetic path they had before windowing existed.
     bf16* cconv = (pos0 != 0) ? cprev : nullptr;
@@ -1622,10 +1697,47 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const int P = moe ? N * topk : 0;                          // routed (token, expert) pairs
     // Short-N: BM=16 fills the tile (avg pairs/expert = N*8/256 = N/32; at 512 → 16).
     // Long-N: BM=128. Override with SPARKINFER_PREFILL_MOE_BM={16,128}.
+    // 32-row tiles (prefill_moe_q.cu's bm16 kernel at BM = 32) only feed the fused quantized-B
+    // GEMM; every other routed path reads a 16- or 128-row tilemap. So they need that GEMM to take
+    // all three weights of every layer: the row scales present, the default all-weights mask, and
+    // only types it decodes.
+    const bool moe_bm32_ok = moe && s.moe_rs_gate && s.moe_rs_up && s.moe_rs_down && [&]{
+        const char* m = getenv("SPARKINFER_PREFILL_MOE_QB");
+        if (m && atoi(m) != 7) return false;
+        if (getenv("SPARKINFER_PREFILL_MOE_FUSED") || getenv("SPARKINFER_PREFILL_MOE_SERIAL")) return false;
+        // The 32 / 64-row tiles exist only in the kernel's 64-row-block form.
+        if (const char* bn = getenv("SPARKINFER_QM_BM16_BN")) if (atoi(bn) == 128) return false;
+        // ... and only while the fused GEMM runs at all: past SPARKINFER_PREFILL_MOE_QB_MAXCTX
+        // (moe_qb_avail below) the prefill materializes, and those kernels read 16 / 128-row maps.
+        const char* mc = getenv("SPARKINFER_PREFILL_MOE_QB_MAXCTX");
+        const int maxctx = (mc && atoi(mc) > 0) ? atoi(mc) : 8192;
+        if (N > maxctx) return false;
+        auto qt_ok = [](int t) { return t == 12 || t == 13 || t == 14; };
+        for (const Qwen35LayerWeights& lw : s.w.layers)
+            if (!qt_ok(lw.gate_qtype) || !qt_ok(lw.up_qtype) || !qt_ok(lw.down_qtype)) return false;
+        return true;
+    }();
     const int moe_bm = [&]{
         if (!moe) return 128;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_BM");
-        if (e) { int v = atoi(e); return (v == 16) ? 16 : 128; }
+        if (e) {
+            const int v = atoi(e);
+            return (v == 16) ? 16 : ((v == 32 || v == 64) && moe_bm32_ok) ? v : 128;
+        }
+        // With the fused GEMM covering every weight, the tile height follows the pairs per expert
+        // (N * top_k / E: 16 at 512 tokens on Qwen3.6): 32-row tiles up to 512 tokens, 64-row up to
+        // the measured crossover against the 128-row kernel, 128 beyond. The pipelined m16n8k32
+        // 128-row kernel (kernels::pfm_moe_gemm_qi8_k32_enabled) moved that crossover from 3072
+        // to 2048: prefill at 3072 tokens 30.3K -> 31.9K tok/s on 128-row tiles, even at 2048,
+        // 8% behind at 1024.
+        // SPARKINFER_PREFILL_MOE_BM64_MAX moves it.
+        static const int bm64_env = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_MOE_BM64_MAX");
+            return e ? atoi(e) : -1;
+        }();
+        const int bm64_max = bm64_env >= 0 ? bm64_env
+                                           : (kernels::pfm_moe_gemm_qi8_k32_enabled() ? 2048 : 3072);
+        if (moe_bm32_ok && N <= bm64_max) return (N <= 512) ? 32 : 64;
         return (N <= 512) ? 16 : 128;
     }();
     const int max_tiles = moe ? (P + moe_bm - 1) / moe_bm + E : 0;
@@ -1680,7 +1792,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (sparkinfer::deterministic_mode()) return false;
         const char* e = getenv("SPARKINFER_PREFILL_MOE_SERIAL");
         if (e) return e[0] != '0';
-        if (moe_bm == 16 && moe_qb_avail) return false;
+        if (moe_bm != 128 && moe_qb_avail) return false;
         return N <= 512;
     }();
     const bool moe_qb = moe_qb_avail && !moe_serial;
@@ -1927,6 +2039,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     static_cast<const char*>(W) + hdr,
                     static_cast<const float*>(W), W_i8, sw, n_out, K, st);
             }
+            // Q8_0 (Qwen3.6's shared experts): quantize the stored blocks straight to int8 rows.
+            if (!w_i8_ready && wtype == 8)
+                w_i8_ready = kernels::launch_prefill_quant_rows_q80(W, W_i8, sw, n_out, K, st);
             if (!w_i8_ready) {
                 const void* wb = dq(W, wtype, n_out, K);
                 kernels::launch_prefill_quantize_rows_i8(wb, W_i8, sw, n_out, K, st);
@@ -1937,8 +2052,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // the e4m3 operands; dequant the weight to bf16 scratch, then row/channel fp8-quantize.
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, R, K, st);
-            const void* wb = dq(W, wtype, n_out, K);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(wtype, W, W_i8, sw, n_out, K, st)) {
+                const void* wb = dq(W, wtype, n_out, K);
+                kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, n_out, K, st);
+            }
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, C, R, n_out, K, st);
         } else {
             // mma.sync bf16 GEMM only for dense-hybrid long prefill (the >96k int8→bf16 fallback).
@@ -2297,11 +2414,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         } else if (fp8_shareq) {
             a_q = nullptr; a_pk = false;                // A_i8 becomes e4m3 -- invalidate the memo
             kernels::launch_prefill_quantize_rows_fp8(A, A_i8, sx, N, H, st);   // xn -> e4m3 once
-            const void* wb = dq(w.wqkv, w.wqkv_type, lqkv, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lqkv, H, st);
+            // Q8_0 weights quantize to e4m3 in place (launch_prefill_quantize_rows_fp8_gguf); other
+            // types still go through a bf16 dequant first.
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(w.wqkv_type, w.wqkv, W_i8, sw, lqkv, H, st))
+                kernels::launch_prefill_quantize_rows_fp8(dq(w.wqkv, w.wqkv_type, lqkv, H), W_i8, sw, lqkv, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, b8, N, lqkv, H, st);
-            wb = dq(w.wqkv_gate, w.wqkv_gate_type, lvdim, H);
-            kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
+            if (!kernels::launch_prefill_quantize_rows_fp8_gguf(w.wqkv_gate_type, w.wqkv_gate, W_i8, sw, lvdim, H, st))
+                kernels::launch_prefill_quantize_rows_fp8(dq(w.wqkv_gate, w.wqkv_gate_type, lvdim, H), W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
             // Fused quantized-B when the row scales exist (proj_fused falls back to proj when they
@@ -2405,6 +2524,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         (s.mrope_pos && c.mrope()) ? s.mrope_pos + (size_t)3 * pos0 : nullptr;
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
+    // The decode rows' block tables, gathered into one [R, mbs] array the per-row attention reads.
+    if (R > 0) dflash_kernels::launch_gather_rows_i32(s.mix_rows, s.mix_btab, mbs, R, st);
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
     if (s.bonsai_embed_native) {
         // Ternary table: decode the row, then take off the rotation it was stored in.
@@ -2600,6 +2721,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
                 }
             }
+            if (R > 0) {
+                // The decode rows: packed decode's GDN step, each row against its own conv window
+                // and recurrent state (in place), on rows [0, R) of the pass's buffers.
+                const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+                const size_t state_off =
+                    (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                kernels::launch_qwen36_conv_split_l2norm_fused_batched(
+                    b8, w.ssm_conv, s.mix_lin_conv, conv_off, gq, gk, gv, R, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                kernels::launch_qwen36_gdn_ar_batched(
+                    gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a, s.mix_lin_state, state_off, att, R,
+                    c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st, s.mix_state_b16);
+            }
             if (multi) {
                 // Each prompt's conv window and recurrence are its own: run both on its slice of the
                 // rows against its session's state -- the same two calls a lone prompt of that
@@ -2615,7 +2749,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // workspace slot; the launches, and so every row of every prompt, are unchanged.
                 // SPARKINFER_PACK_GDN_STREAMS=1 keeps them on one stream (A/B in one binary).
                 constexpr int kSegStreams = 3;
-                static const int seg_streams = [] {
+                static const int seg_streams = [&] {
                     const char* e = getenv("SPARKINFER_PACK_GDN_STREAMS");
                     const int v = e ? atoi(e) : kSegStreams;
                     return v < 1 ? 1 : v > kSegStreams ? kSegStreams : v;
@@ -2639,16 +2773,62 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 for (int i = 0; i < nseg; ++i) {
                     const size_t o = (size_t)s.multi_off[i];
                     const int len = s.multi_len[i];
+                    const int ck = s.multi_ckpt_row ? s.multi_ckpt_row[i] : 0;
                     const int j = i % ns;
                     cudaStream_t ss = j ? seg_st[j] : st;
-                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv,
-                        static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at,
+                    if (ck > 0 && ck < len && s.multi_ckpt_host && s.multi_ckpt_host[i]) {
+                        // This prompt's checkpoint: its conv and scan in two parts, with this
+                        // layer's state and window copied to the snapshot between them, as the
+                        // one-prompt path does -- on the prompt's own segment stream, staging the
+                        // second part's conv window in that stream's slot. (They used to run on the
+                        // pass's stream through one shared staging buffer, so a pack of chat prompts
+                        // -- every one with a checkpoint -- scanned its prompts one after another.)
+                        // The scan's workspace slot is the stream's too, as for any segment.
+                        const size_t conv_elems = (size_t)(c.linear_conv_kernel - 1) * lqkv;
+                        const size_t state_elems = (size_t)vh * c.linear_head_dim * c.linear_head_dim;
+                        bf16* conv_state = static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at;
+                        float* layer_state = s.multi_lin_state[i] + state_at;
+                        for (int part = 0; part < 2; ++part) {
+                            const size_t po = o + (part ? (size_t)ck : 0);
+                            const int plen = part ? len - ck : ck;
+                            if (part)
+                                pf_cu(cudaMemcpyAsync(cprev_seg[j], conv_state, conv_elems * sizeof(bf16),
+                                                      cudaMemcpyDeviceToDevice, ss), "gdn conv carry-in");
+                            kernels::launch_prefill_gdn_conv(b8 + po * lqkv, w.ssm_conv, conv_state,
+                                gq + po * lq, gk + po * lq, gv + po * lvdim, plen, c.linear_q_heads, vh,
+                                c.linear_head_dim, c.linear_conv_kernel, eps, ss,
+                                part ? cprev_seg[j] : nullptr);
+                            kernels::launch_prefill_gdn_scan(gq + po * lq, gk + po * lq, gv + po * lvdim,
+                                la + po * vh, lb + po * vh, w.ssm_dt, w.ssm_a, layer_state,
+                                att + po * lvdim, plen, c.linear_q_heads, vh, c.linear_head_dim,
+                                c.gdn_qh_block, ss, /*carry_in=*/part != 0, j);
+                            if (!part) {
+                                char* host = static_cast<char*>(s.multi_ckpt_host[i]);
+                                pf_cu(cudaMemcpyAsync(host + (size_t)gdn_state_slot(c, L) * state_elems * sizeof(float),
+                                                      layer_state, state_elems * sizeof(float),
+                                                      cudaMemcpyDeviceToHost, ss), "checkpoint state");
+                                pf_cu(cudaMemcpyAsync(host + s.ckpt_state_bytes + (size_t)L * conv_elems * sizeof(bf16),
+                                                      conv_state, conv_elems * sizeof(bf16),
+                                                      cudaMemcpyDeviceToHost, ss), "checkpoint conv");
+                            }
+                        }
+                        continue;
+                    }
+                    // A chunk resuming mid-prompt carries its session's conv window and recurrence
+                    // in, as a windowed single-prompt pass does -- staged in this stream's own slot.
+                    const bool carry = s.multi_pos0 && s.multi_pos0[i] > 0;
+                    bf16* seg_conv = static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at;
+                    if (carry)
+                        pf_cu(cudaMemcpyAsync(cprev_seg[j], seg_conv,
+                                              (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
+                                              cudaMemcpyDeviceToDevice, ss), "gdn segment conv carry-in");
+                    kernels::launch_prefill_gdn_conv(b8 + o * lqkv, w.ssm_conv, seg_conv,
                         gq + o * lq, gk + o * lq, gv + o * lvdim, len, c.linear_q_heads, vh,
-                        c.linear_head_dim, c.linear_conv_kernel, eps, ss, nullptr);
+                        c.linear_head_dim, c.linear_conv_kernel, eps, ss, carry ? cprev_seg[j] : nullptr);
                     kernels::launch_prefill_gdn_scan(gq + o * lq, gk + o * lq, gv + o * lvdim,
                         la + o * vh, lb + o * vh, w.ssm_dt, w.ssm_a,
                         s.multi_lin_state[i] + state_at, att + o * lvdim, len, c.linear_q_heads,
-                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/false, j);
+                        vh, c.linear_head_dim, c.gdn_qh_block, ss, /*carry_in=*/carry, j);
                 }
                 for (int j = 1; j < ns; ++j) {
                     pf_cu(cudaEventRecord(seg_ev[j], seg_st[j]), "gdn segment done");
@@ -2697,14 +2877,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     pf_cu(cudaMemcpyAsync(cprev, conv_state,
                                           (size_t)(c.linear_conv_kernel - 1) * lqkv * sizeof(bf16),
                                           cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
-                kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
-                    N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
+                // The chunk is rows [R, N) (R = 0 unless this is a mixed step).
+                const size_t lqr = (size_t)R * s.linear_qdim;
+                kernels::launch_prefill_gdn_conv(b8 + (size_t)R * lqkv, w.ssm_conv, conv_state,
+                    gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
+                    N - R, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
                 float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
                 // A pass that does not start at position 0 continues the recurrence already in `state`
                 // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
-                kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
-                    layer_state, att, N, c.linear_q_heads, vh, c.linear_head_dim,
-                    c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
+                kernels::launch_prefill_gdn_scan(gq + lqr, gk + lqr, gv + (size_t)R * lvdim,
+                    la + (size_t)R * vh, lb + (size_t)R * vh, w.ssm_dt, w.ssm_a,
+                    layer_state, att + (size_t)R * lvdim, N - R, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0);
             }
             if (z_pending) pf_cu(cudaStreamWaitEvent(st, gdn_ev[3], 0), "gdn z join");
             if (z_deferred)   // the kernel before it on st is the scan (or, off the chunked arm,
@@ -3094,20 +3278,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     // A packed pass writes and attends one prompt at a time: its own block table,
                     // its own positions from zero, attending only to itself. Its q/k/v rows are
                     // already contiguous, so the per-prompt calls just take the slice.
+                    if (R > 0) {
+                        // The decode rows: packed decode's per-row QK-norm/RoPE/KV append (it
+                        // re-splits [q|gate] from the raw projection into qb/qg), then split-KV
+                        // decode attention over each row's own table.
+                        kernels::launch_qknorm_rope_kv_partial_int8_gated(
+                            b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale,
+                            s.mix_btab, s.mix_pos, R, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                            rope_dim, rope_theta, eps, bs, mbs, st);
+                        const size_t fa_n = (size_t)R * c.n_q_heads * s.mix_splits;
+                        kernels::launch_flash_decode_split(
+                            qb, kpool, vpool, s.mix_btab, s.mix_seq, att,
+                            s.mix_fa, s.mix_fa + fa_n, s.mix_fa + 2 * fa_n,
+                            R, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, s.mix_splits,
+                            attn_scale, st, nullptr, s.mix_seq_hint, kscale, vscale, 1, nullptr);
+                    }
                     const int segs = multi ? nseg : 1;
                     for (int i = 0; i < segs; ++i) {
-                        const size_t o = multi ? (size_t)s.multi_off[i] : 0;
-                        const int len = multi ? s.multi_len[i] : N;
+                        const size_t o = multi ? (size_t)s.multi_off[i] : (size_t)R;
+                        const int len = multi ? s.multi_len[i] : N - R;
                         const int* bt = multi ? (w.swa ? s.kv->block_table_win(s.multi_seq_ids[i])
                                                        : s.kv->block_table(s.multi_seq_ids[i]))
                                               : ltab;
+                        // A mixed step's chunk appends at its own position in its own sequence.
+                        const int sp0 = (multi && s.multi_pos0) ? s.multi_pos0[i] : pos0;
                         kernels::launch_prefill_qknorm_rope_kv_int8(qb + o * qdim, kf + o * kvdim,
                             vf + o * kvdim, w.q_norm, w.k_norm, kpool, vpool, kscale, vscale, bt,
                             len, c.n_q_heads, c.n_kv_heads, c.head_dim, rope_dim, rope_theta, eps,
-                            bs, mbs, st, pos0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
+                            bs, mbs, st, sp0, mrope_win, c.mrope_sec_h, c.mrope_sec_w);
                         if (!kernels::launch_prefill_attn_int8_paged(qb + o * qdim, kpool, vpool,
                                 kscale, vscale, bt, att + o * qdim, len, c.n_q_heads, c.n_kv_heads,
-                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, pos0)) {
+                                c.head_dim, bs, mbs, attn_scale, win_blocks, st, sp0)) {
                             a.free_all(); a8.free_all(); am.free_all(); aw.free_all();
                             fprintf(stderr, "[prefill] no int8 attention kernel for hd=%d win=%d "
                                             "pos0=%d\n", c.head_dim, win_blocks, pos0);
@@ -4529,10 +4730,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (capture_dflash) {
             for (int slot = 0; slot < s.n_capture; ++slot) {
                 if (s.capture_layers[slot] != L) continue;
-                const int first = std::max(0, s.capture_start);
+                // capture_start is a sequence position and the destination's row 0 is that
+                // position; a pass that starts at pos0 (a window, or a prefix-cache resume) writes
+                // its rows at pos0 + i - capture_start.
+                const int first = std::max(0, s.capture_start - pos0);
                 if (first >= N) continue;
                 char* dst = static_cast<char*>(s.capture_dst) +
-                            (size_t)slot * H * sizeof(bf16);
+                            ((size_t)(pos0 + first - s.capture_start) * s.n_capture + slot) * H *
+                                sizeof(bf16);
                 dflash_kernels::launch_capture_rows(
                     x + (size_t)first * H, dst, N - first, H, s.n_capture * H, st);
             }
@@ -4596,9 +4801,34 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (moe_hide_sg)
         cudaEventDestroy(moe_ev_sg);
 
+    // A mixed step's decode rows: their logits off the final-normed rows [0, R), with packed
+    // decode's Q4_K head -- one read of the head for all of them -- and their argmax, read back
+    // with the seed below.
+    if (R > 0) {
+        kernels::launch_quantize_q8_1_rows(xn, s.mix_q81, H, R, H, st);
+        const bool q4k_head = s.w.lm_head_type == 12;
+        if (!(q4k_head && kernels::launch_mmvq_q4k_mma_head_f32(s.mix_q81, s.w.lm_head, s.mix_logits,
+                                                                R, c.vocab, H, st)) &&
+            !kernels::launch_mmvq_rows_f32(s.w.lm_head_type, s.mix_q81, s.w.lm_head, s.mix_logits,
+                                           R, c.vocab, H, st) && q4k_head) {
+            const size_t q81_row = kernels::llama_q8_1_bytes(H);
+            for (int r = 0; r < R; ++r)
+                kernels::launch_mmvq_q4k_f32(static_cast<const unsigned char*>(s.mix_q81) + r * q81_row,
+                                             s.w.lm_head, s.mix_logits + (size_t)r * c.vocab,
+                                             c.vocab, H, st);
+        }
+        kernels::launch_argmax(s.mix_logits, s.mix_d_out, R, c.vocab, st);
+        pf_cu(cudaMemcpyAsync(s.mix_out, s.mix_d_out, (size_t)R * sizeof(int),
+                              cudaMemcpyDeviceToHost, st), "mixed rows argmax");
+    }
     // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
     // A packed pass has one per prompt, each read back as it is produced (it never captures).
-    for (int si = 0; si < (multi ? nseg : 1); ++si) {
+    // A mixed step's chunks that do not finish their prompts take no seed and no head pass; with
+    // none finishing, the pass returns 0.
+    if (multi && s.multi_no_seed)
+        pf_cu(cudaMemsetAsync(s.d_out_id, 0, sizeof(int), st), "no-seed pass");
+    for (int si = 0; si < ((multi && s.multi_no_seed) ? 0 : (multi ? nseg : 1)); ++si) {
+        if (multi && s.multi_want_seed && !s.multi_want_seed[si]) continue;
         const int last_row = multi ? s.multi_off[si] + s.multi_len[si] - 1 : N - 1;
         const bf16* xn_last = xn + (size_t)last_row * H;
         // Q4_K head: quantize the activation ONCE and run the pre-quantized dp4a GEMV. gemv.cu calls
@@ -4780,8 +5010,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // this is a window of a longer prompt whose next window follows at once (prefill_hold_arena):
     // it would allocate exactly what this one frees, and the free/malloc pair of a 16k window's
     // ~37 buffers costs ~10.6 ms of idle GPU per window boundary. The last window still releases.
+    // ...or when what it holds is well past what recent calls used: the arenas only ever grow, so
+    // one long prompt (an 8K pass's ~0.9 GB, just under the keep limit) used to stay resident
+    // for every later chat-sized pass. Near the card's edge -- a c32 server's KV pool and 32
+    // sessions' recurrent state leave ~1 GB -- that headroom is what the packed prefill's
+    // scratch and the GDN scan workspaces need: chat c32 after an 8K cell measured 1,026 tok/s
+    // against 1,182 on a fresh server, its packed passes 278 ms against 207. The kernel-level
+    // scratch a long pass grew (the GDN scan workspaces, the attention V plane) goes with them.
+    const size_t pf_held = a.total() + a8.total() + am.total() + aw.total();
+    const size_t pf_used = a.used + a8.used + am.used + aw.used;
+    static const bool shrink_on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_SHRINK");
+        return !(e && e[0] == '0');
+    }();
+    // Against the largest use of the last 8 passes, not this one alone: a chat workload alternates
+    // one-prompt and packed passes of a few sizes, and freeing on every smaller one would churn
+    // the arenas (and the whole-prefill graph) every other pass. A one-off long prompt ages out of
+    // the window after a few ordinary passes and is given back once.
+    static thread_local size_t recent_used[8] = {};
+    static thread_local int recent_i = 0;
+    recent_used[recent_i++ & 7] = pf_used;
+    size_t recent_max = 0;
+    for (size_t u : recent_used) recent_max = std::max(recent_max, u);
+    const bool pf_oversized = shrink_on && pf_held > 2 * recent_max + (64ull << 20);
+    if (arena_dbg)
+        fprintf(stderr, "[prefill-arena] N=%d held %.0f MB used %.0f MB recent max %.0f MB%s\n", N,
+                pf_held / 1048576.0, pf_used / 1048576.0, recent_max / 1048576.0,
+                (!arena_reuse || (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized)))
+                    ? " -> release" : "");
     if (!arena_reuse ||
-        (!g_pf_hold_arena && a.total() + a8.total() + am.total() + aw.total() > kArenaKeepBytes)) {
+        (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized))) {
+        if (shrink_on) kernels::prefill_scratch_release();
         a.free_all();
         a8.free_all();
         am.free_all();
@@ -4939,7 +5198,25 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // per row instead of broadcast, the GDN block runs the batched per-row AR step instead of the
     // compact scan, the KV-append uses the per-row-table kernel instead of the single-sequence
     // one, and there is no accepted-prefix commit because every row is already a real step.
-    const bool packed = s.packed_rows != nullptr;
+    // A grouped verify (several sequences' blocks, Qwen35PrefillCtx::group_n) takes packed decode's
+    // per-row tables and positions for its attention, but the compact GDN scan and the commit of
+    // an accepted prefix per group; `packed` keeps meaning independent one-token rows.
+    const bool per_row = s.packed_rows != nullptr;
+    const bool grouped = per_row && s.group_n > 0;
+    if (grouped && (!s.group_off || !s.group_len || !s.group_lin_state || !s.group_lin_conv ||
+                    !s.group_keep || !s.verify_eager || capture_only))
+        return -1;
+    const bool packed = per_row && !grouped;
+    // Many rows at once, packed or grouped: the width-driven choices below (the block-scaled GEMM
+    // arms, the attention split count, the multi-row head) are the same for both. Without them a
+    // grouped verify reads every weight once per 8 rows (4 x 8 rows: 56 ms against 16.6).
+    // SPARKINFER_GROUPED_WIDE=0 keeps a grouped verify on the row kernels, which is bit-identical
+    // per group to verifying that sequence alone (grouped_verify_check).
+    static const bool grouped_wide = [] {
+        const char* e = getenv("SPARKINFER_GROUPED_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    const bool wide = packed || (grouped && grouped_wide);
     if (packed) {
         muse_stream_cache_packed_seen() = true;
         muse_stream_cache().release();
@@ -4964,7 +5241,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // seqlen > 512 and mma_chunk >= 32). Packed rows have independent lengths, so take the
     // longest: the per-row lengths the kernel actually reads still come from `seq`.
     int packed_seq_hint = 0;
-    if (packed)
+    if (per_row)
         for (int i = 0; i < N; i++)
             if (s.packed_pos[i] + 1 > packed_seq_hint) packed_seq_hint = s.packed_pos[i] + 1;
     // Every arena buffer below is sized for the WIDEST verify tier, not for this call's N.
@@ -4984,7 +5261,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         fprintf(stderr, "]\n");
     }
     cudaStream_t st = s.stream;
-    VerifyGraphCache& graph_cache = verify_graph_cache();
+    VerifyGraphCache& graph_cache = s.verify_eager ? verify_eager_cache() : verify_graph_cache();
     graph_cache.arena.rewind();
     Arena& a = graph_cache.arena;
     bf16* x = a.alloc<bf16>((size_t)NA * H);
@@ -5034,7 +5311,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* f8_sw[2] = {nullptr, nullptr};
     float* f8_p[2] = {nullptr, nullptr};
     size_t f8_p_bytes = 0;
-    if (packed && fp8_ckpt && kFp8GemmMinRows > 0) {
+    if (wide && fp8_ckpt && kFp8GemmMinRows > 0) {
         const int f8_kwide = std::max(H, lvdim);
         const int f8_nwide = std::max(std::max(lqkv, lvdim), H);
         for (int i = 0; i < 2; ++i) {
@@ -5063,11 +5340,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // SPARKINFER_PROJ_GEMM_MIN_ROWS raises or disables the threshold for an A/B in one binary.
     // Which full-attention projections take the GEMM arm: bit 0 = wq, bit 1 = wo, bit 2 = wk/wv
     // (bit 2 requires bit 0, since it rides wq's quantize of xn). All by default; the bits exist
-    // so each can be measured against the others out of ONE binary.
+    // so each can be measured against the others out of ONE binary. Bit 2 was off: at 32 rows k/v
+    // then ran as 8-row GEMV chunks, four reads of each weight (~1 ms of a speculating c8 step).
+    // On, c8 speculation at T=1.0 went 1001/1005 -> 1017/1013 tok/s, and plain packed decode stayed
+    // flat (AIPerf chat c16 / c32 per-user 52.95 / 37.51 -> 53.00 / 38.50 tok/s).
     static const int kAttnGemm = [] {
         const char* e = getenv("SPARKINFER_ATTN_GEMM");
-        const int v = e ? atoi(e) : 3;
-        return (v >= 0 && v <= 7) ? v : 3;
+        const int v = e ? atoi(e) : 7;
+        return (v >= 0 && v <= 7) ? v : 7;
     }();
     // Rows at which the packed projections leave the row-GEMVs for the block-scaled GEMM. 8 is
     // the smallest width its A-quantizer takes (m % 8 == 0); since the transposed orientation
@@ -5081,7 +5361,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // [NA, qkvg_n] bf16 landing pad for the fused q|gate|k|v block-scaled GEMM below.
     bf16* fp4_qkv = nullptr;
     const int qkvg_n = 2 * qdim + 2 * kvdim;
-    if (packed && c.dense_ffn) {
+    if (wide && c.dense_ffn) {
         const size_t ab = kernels::prefill_nvfp4_data_bytes(NA, fp4_kwide);
         const size_t sb = kernels::prefill_nvfp4_scale_bytes_a(NA, fp4_kwide);
         size_t wb = kernels::prefill_nvfp4_workspace_bytes(NA, c.moe_ffn, H);
@@ -5250,7 +5530,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* moe_h = a.alloc<float>((size_t)NA * topk * ffn);
     // Gate accumulator for the tensor-core gate/up a wide packed step takes on a dense Q4_K FFN.
     // Only for a stack that has one: an all-NVFP4 FFN never reads it, and Muse takes its own body.
-    const bool gu_acc_needed = packed && dense && !muse && [&] {
+    const bool gu_acc_needed = wide && dense && !muse && [&] {
         for (int L = 0; L < c.n_layers; ++L) {
             const Qwen35LayerWeights& lw = s.w.layers[L];
             if (lw.gate_q && lw.gate_qtype == 12 && !(lw.gate_nv && lw.up_nv && lw.down_nv))
@@ -5272,7 +5552,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }();
     // A stack whose gate/up are ternary (the default Ternary-Bonsai-2 load) still runs a Q4_K down
     // and Q4_K in-projections, so it keeps the same floor without needing gu_acc.
-    const bool ternary_gu_stack = packed && dense && !muse && [&] {
+    const bool ternary_gu_stack = wide && dense && !muse && [&] {
         for (int L = 0; L < c.n_layers; ++L) {
             const Qwen35LayerWeights& lw = s.w.layers[L];
             if (lw.gate_q && lw.gate_qtype == kPtq1GgmlType && lw.down_qtype == 12) return true;
@@ -5296,6 +5576,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* shared_h = a.alloc<float>((size_t)NA * ffn);
     float* logits = a.alloc<float>((size_t)NA * c.vocab);
     if (packed && s.packed_logits_out) *s.packed_logits_out = logits;
+    if (!packed && s.verify_logits_out) *s.verify_logits_out = logits;
     int* out_ids = a.alloc<int>(NA);
     const size_t q81_stride_max = kernels::llama_q8_1_bytes(std::max(H, lvdim));
     void* q81 = a.alloc<unsigned char>((size_t)NA * q81_stride_max);
@@ -5367,6 +5648,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // The decode shadow's weights are baked into a packed graph; release_bonsai_shadow frees
     // them, and the null this then reads as must not replay a graph that still points there.
     static thread_local const void* graph_shadow_key = nullptr;
+    // The NVFP4 LM head a wide packed pass reads (see kHeadGemmMinRows). It can be released at
+    // runtime (Qwen35Model::release_lm_head_fp4) to give a prefill its arena, and a graph
+    // recorded while it was resident would then replay against freed memory.
+    static thread_local const void* graph_head4_key = nullptr;
     static thread_local const void* verify_head_key = nullptr;
     static thread_local signed char* verify_head_i8 = nullptr;
     static thread_local float* verify_head_scale = nullptr;
@@ -5446,7 +5731,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     for (int i = 0; i < N; ++i) {
         ph_ids[i] = token_ids[i];
         // Packed rows each sit at their OWN sequence's next position; verify rows are consecutive.
-        ph_pos[i] = packed ? s.packed_pos[i] : start_pos + i;
+        ph_pos[i] = per_row ? s.packed_pos[i] : start_pos + i;
         ph_seq[i] = ph_pos[i] + 1;
     }
 
@@ -5763,7 +6048,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // a few KB) so the 10 full-attention layers each run ONE split + ONE combine instead of one per
     // row. That removes 2*(N-1) graph nodes per attention layer, and the graph is ~1000 nodes deep
     // against only ~5.6 ms of kernel time, so node count is itself a real cost here.
-    int* btab_rows = (N > 1 || packed) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
+    int* btab_rows = (N > 1 || per_row) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
     // The same per-row gather for the windowed layers' tables. Only allocated when this pool
     // actually caps them, so an uncapped pool carries neither the buffer nor the extra gather.
     int* btab_rows_win = (btab_rows && s.kv->windowed()) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
@@ -5791,10 +6076,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const void* conv_key    = packed ? (const void*)s.packed_lin_conv  : (const void*)s.lin_conv_state;
     const void* btable_key  = packed ? (const void*)s.packed_rows      : (const void*)btable;
     const uint64_t seq_key  = packed ? UINT64_MAX - 1 : s.seq_id;
-    if (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
+    if (!s.verify_eager && (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
         graph_conv_key != conv_key || graph_capture_key != capture_dst ||
         graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns ||
-        graph_shadow_key != (const void*)s.bonsai_dec_layers) {
+        graph_shadow_key != (const void*)s.bonsai_dec_layers ||
+        graph_head4_key != (const void*)s.w.lm_head_fp4)) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -5810,9 +6096,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_seq_key = seq_key;
         graph_ns_key = ns;
         graph_shadow_key = s.bonsai_dec_layers;
+        graph_head4_key = s.w.lm_head_fp4;
     }
-    if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
-    if (graph_ready_t[N]) {
+    if (!s.verify_eager && graph_ready_t[N] && capture_only) return 0;   // this tier is already built
+    if (!s.verify_eager && graph_ready_t[N]) {
         pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
@@ -5847,7 +6134,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_MUSE_CB_Q4K_F16_MINROWS");
         return e ? atoi(e) : 8;
     }();
-    muse_f16 = muse && packed && muse_f16_min > 0 && N >= muse_f16_min &&
+    muse_f16 = muse && wide && muse_f16_min > 0 && N >= muse_f16_min &&
                kernels::q4k_f16_rows_enabled() && kernels::q4k_f16_rows_reserve(st);
     // The hd256 checkpoints' Q4_K matmuls on the fp16 tensor cores at packed widths
     // (launch_mmvq_q4k_f16_rows and friends): the attention q|gate, k/v and o projections, the
@@ -5861,17 +6148,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const char* e = getenv("SPARKINFER_CB_Q4K_F16_MINROWS");
         return e ? atoi(e) : 8;
     }();
-    q4k_f16 = !muse && packed && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
+    q4k_f16 = !muse && wide && c.head_dim == 256 && dense && !s.bonsai_sign_hidden &&
               q4k_f16_min > 0 && N >= q4k_f16_min && kernels::q4k_f16_rows_enabled() &&
               kernels::q4k_f16_rows_reserve(st) && kernels::q4k_f16_rows_reserve(s.stream_k);
-    // Packed decode always records. `recording` gates the EndCapture/instantiate/launch trio at
-    // the bottom, while BeginCapture below is unconditional on this path (we only get here when
-    // this tier's graph is NOT ready), so a false `recording` begins a capture that is never
-    // ended and strands the stream -- every later call then fails with "operation not permitted
-    // when stream is capturing". DSpark never sees that because dflash_generate warms each tier
-    // with a capture_only call during session setup; packed decode has no such warmup.
-    recording = graph_warm || capture_only || packed;
-    if (recording)
+    // Packed decode always records. `recording` gates both the BeginCapture below and the
+    // EndCapture/instantiate/launch trio at the bottom; a pass that does not record runs its
+    // kernels eagerly. (BeginCapture used to be unconditional here -- a stray `if (recording)`
+    // guarded the FP8 memset loop below instead -- so a pass that did not record began a capture
+    // it never ended and stranded the stream: every later call failed with "operation not
+    // permitted when stream is capturing". DSpark never hit it because dflash_generate warms each
+    // tier with a capture_only call first; an eager pass (verify_eager) is the first caller that
+    // does not record.)
+    recording = !s.verify_eager && (graph_warm || capture_only || packed);
     // Dense FFN seeds: expert 0, weight 1.0 -- the same constants AR uses. Written ONCE, here,
     // SYNCHRONOUSLY, and deliberately BEFORE the capture begins.
     //
@@ -5891,9 +6179,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (dense && expert_ids && expert_w) {
         std::vector<float> ones((size_t)N * topk, 1.0f);
         pf_cu(cudaMemset(expert_ids, 0, (size_t)N * topk * sizeof(int)), "dense expert ids seed");
-        pf_cu(cudaMemcpy(expert_w, ones.data(), ones.size() * sizeof(float),
+        pf_cu(si_h2d_complete(expert_w, ones.data(), ones.size() * sizeof(float),
                          cudaMemcpyHostToDevice), "dense expert w seed");
     }
+    if (recording)
         pf_cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "verify graph begin");
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
@@ -5902,13 +6191,13 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // grows instead of baking in the mapping from capture time. One kernel node rather than N
     // memcpy nodes -- same reason as the capture copies above.
     if (btab_rows) {
-        if (packed)
+        if (per_row)
             dflash_kernels::launch_gather_rows_i32(s.packed_rows, btab_rows, mbs, N, st);
         else
             dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     }
     if (btab_rows_win) {
-        if (packed && s.packed_rows_win)
+        if (per_row && s.packed_rows_win)
             dflash_kernels::launch_gather_rows_i32(s.packed_rows_win, btab_rows_win, mbs, N, st);
         else
             dflash_kernels::launch_broadcast_rows_i32(btable_win, btab_rows_win, mbs, N, st);
@@ -6244,7 +6533,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
             const bool gu_gemm =
-                packed && topk == 1 && N >= gu_gemm_min_rows() &&
+                wide && topk == 1 && N >= gu_gemm_min_rows() &&
                 packed_gate_up_nvfp4(w, hn, Ng, ffn, H, fp4_a, fp4_asf, fp4_ws, sg, su, st);
             // ...and down through its FP4 copy when it is resident, or a streamed Q6_K convert
             // into the persistent operand when it is not -- the Q4_K MMA was a quarter of the step.
@@ -6328,7 +6617,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 bonsai_rot_k = H;
             }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
-            const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+            const bool gdn_in_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
                                      w.gdn_z_fp4 && w.gdn_z_fp4_sf;
             // Issued BEFORE the fork deliberately. Both in-projections read fp4_a/fp4_asf, and
@@ -6388,7 +6677,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 return e ? atoi(e) : 16;
             }();
             const bool ab_fused = w.ssm_alpha_type == 0 && w.ssm_beta_type == 0 &&
-                ((packed && ab_mma_min > 0 && N >= ab_mma_min &&
+                ((wide && ab_mma_min > 0 && N >= ab_mma_min &&
                   kernels::launch_gemv_rows2_mma(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H,
                                                  gst)) ||
                  kernels::launch_gemv_rows2(xn, w.ssm_alpha, w.ssm_beta, ra, rb, N, vh, vh, H, gst));
@@ -6444,6 +6733,48 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     vfail_L = L;
                     break;
                 }
+            } else if (grouped) {
+                // Each group against its own session's conv window and state, read-only: the
+                // commit after the verify writes each group's accepted prefix.
+                if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "grouped gdn ab wait");
+                const size_t lq = (size_t)s.linear_qdim;
+                // One launch each for every sequence where it fits (DfGdnGroups::kMax); the
+                // per-sequence launches otherwise. SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0 keeps those.
+                static const bool one_launch = [] {
+                    const char* e = getenv("SPARKINFER_GROUPED_GDN_ONE_LAUNCH");
+                    return !(e && e[0] == '0');
+                }();
+                bool fused = false;
+                if (one_launch && s.group_n <= kernels::DfGdnGroups::kMax) {
+                    kernels::DfGdnGroups gc, gs;
+                    gc.n = gs.n = s.group_n;
+                    for (int g = 0; g < s.group_n; ++g) {
+                        gc.off[g] = gs.off[g] = s.group_off[g];
+                        gc.len[g] = gs.len[g] = s.group_len[g];
+                        gc.state[g] = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
+                        gs.state[g] = s.group_lin_state[g] + state_off;
+                    }
+                    fused = kernels::launch_dflash_gdn_conv_compact_grouped(
+                                rq, w.ssm_conv, gc, gq, rk, rv, c.linear_q_heads, vh, c.linear_head_dim,
+                                c.linear_conv_kernel, c.rms_eps, st) &&
+                            kernels::launch_dflash_gdn_scan_compact_grouped(
+                                gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a, gs, att, c.linear_q_heads, vh,
+                                c.linear_head_dim, c.gdn_qh_block, st);
+                }
+                if (!fused) {
+                    for (int g = 0; g < s.group_n; ++g) {
+                        const size_t o = (size_t)s.group_off[g];
+                        const int len = s.group_len[g];
+                        const bf16* conv_live = static_cast<const bf16*>(s.group_lin_conv[g]) + conv_off;
+                        kernels::launch_dflash_gdn_conv_compact(rq + o * lqkv, w.ssm_conv, conv_live,
+                            gq + o * lq, rk + o * lq, rv + o * lvdim, len, c.linear_q_heads, vh,
+                            c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                        kernels::launch_dflash_gdn_scan_compact(gq + o * lq, rk + o * lq, rv + o * lvdim,
+                            ra + o * vh, rb + o * vh, w.ssm_dt, w.ssm_a, s.group_lin_state[g] + state_off,
+                            att + o * lvdim, len, c.linear_q_heads, vh, c.linear_head_dim,
+                            c.gdn_qh_block, st);
+                    }
+                }
             } else {
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
@@ -6480,7 +6811,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                     c.linear_head_dim, c.rms_eps, st);
             }
-            const bool gdn_out_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
+            const bool gdn_out_gemm = wide && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                       w.gdn_out_fp4 && w.gdn_out_fp4_sf;
             if (out_t)
                 supported = kernels::launch_gemm_ptq1_i8_rows_bf16(
@@ -6507,7 +6838,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             const bool attn_t = tw && s.bonsai_sign_hidden && tw->wq_type == kPtq1GgmlType &&
                                 tw->wk_type == kPtq1GgmlType && tw->wv_type == kPtq1GgmlType;
             const bool fork_attn = !attn_t && fork_shared && q81_src == xn && q81_k == H &&
-                                   !((kAttnGemm & 4) && (kAttnGemm & 1) && packed && fp4_a &&
+                                   !((kAttnGemm & 4) && (kAttnGemm & 1) && wide && fp4_a &&
                                      fp4_asf && N >= kProjGemmMinRows &&
                                      w.wq_fp4 && w.wk_fp4 && w.wv_fp4);
             cudaStream_t ast = fork_attn ? s.stream_k : st;
@@ -6525,7 +6856,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // eight CTAs of a 128-wide tile -- 5% of the machine -- so the GEMM would be far
             // slower than the GEMV there even reading the weights once. They are also only
             // 2.78 MB apiece, a twentieth of what wq and wo move.
-            const bool attn_q_gemm = !attn_t && (kAttnGemm & 1) && packed && fp4_a && fp4_asf &&
+            const bool attn_q_gemm = !attn_t && (kAttnGemm & 1) && wide && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wq_fp4 && w.wq_fp4_sf;
             // quant_nv_rows(xn, H) above still runs unconditionally, so the int8 staging that
             // proj_pair_nv_on expects to find already cached is there whether or not wq took the
@@ -6618,7 +6949,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             if (kv8) {
-                if (packed)
+                if (per_row)
                     kernels::launch_qknorm_rope_kv_partial_int8_gated(
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
@@ -6630,7 +6961,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         c.rms_eps, bs, mbs, st);
             } else {
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
-                if (packed)
+                if (per_row)
                     kernels::launch_qknorm_rope_kv_partial(
                         qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
@@ -6641,11 +6972,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
             }
-            // Match the autoregressive decode path exactly. Its fused int8 attention gate is
-            // enabled only for the 2048/4096-wide layouts; Qwen3.8 (H=5120) applies sigmoid(g)
-            // in a separate kernel. Using the fused accumulation here changed verifier logits
-            // after the first speculative token even though both paths consumed the same KV.
-            const bool int8_gate_fused = kv8 && (H == 2048 || H == 4096);
+            // The gate stays a separate kernel here. launch_flash_decode_split applies an
+            // attn_gate only in its gated combine, which runs only beside a Q8 output (out_q8, as
+            // the autoregressive step passes it); this call passes none, so a gate handed to it
+            // was dropped -- and handing it over also skipped launch_qwen36_mul_sigmoid below.
+            // That left Qwen3.6-35B-A3B (H=2048) ungated in every packed step: garbage output for
+            // any 2+ concurrent requests (packed_decode_check: 0% argmax agreement with one
+            // forward per row, from the first full-attention layer).
+            const bool int8_gate_fused = false;
             // The session's split count is sized for ONE row walking its context; a packed step
             // already has N rows x kv-heads CTAs per split, so at 32 rows the 32 splits leave
             // each CTA a dozen keys and write as many partial bytes as they read KV. From 24
@@ -6658,7 +6992,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }();
             const int cb_attn_splits = cb_attn_env >= 0 ? cb_attn_env
                                                         : (s.bonsai_sign_hidden ? 8 : 16);
-            const int ns_attn = (packed && N >= 24 && cb_attn_splits > 0 &&
+            const int ns_attn = (wide && N >= 24 && cb_attn_splits > 0 &&
                                  cb_attn_splits < ns)
                               ? cb_attn_splits : ns;
             kernels::launch_flash_decode_split(
@@ -6675,7 +7009,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // computing what has to be the same number is precisely how the batched path
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
-                1.f / sqrtf((float)c.head_dim), st, nullptr, packed ? packed_seq_hint : start_pos + N,
+                1.f / sqrtf((float)c.head_dim), st, nullptr, per_row ? packed_seq_hint : start_pos + N,
                 ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
@@ -6685,7 +7019,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             if (!int8_gate_fused && !wo_t) {
                 kernels::launch_qwen36_mul_sigmoid(att, qg, N * qdim, st);
             }
-            const bool attn_o_gemm = (kAttnGemm & 2) && packed && fp4_a && fp4_asf &&
+            const bool attn_o_gemm = (kAttnGemm & 2) && wide && fp4_a && fp4_asf &&
                                      N >= kProjGemmMinRows && w.wo_fp4 && w.wo_fp4_sf;
             if (wo_t)
                 supported = kernels::launch_ptq1_gate_rotq_bf16(
@@ -6790,7 +7124,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 const int v = e ? atoi(e) : 8;
                 return v < 1 ? 1 : v;
             }();
-            const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
+            const bool ffn_gemm = wide && topk == 1 && fp4_a && fp4_asf &&
                                   N >= kFfnGemmMinRows && w.gate_fp4 && w.gate_fp4_sf &&
                                   w.up_fp4 && w.up_fp4_sf && w.down_fp4 && w.down_fp4_sf;
             // Packed decode against the Bonsai decode shadow: the ternary legs single-row decode
@@ -7129,7 +7463,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Same bound decides the pinned split count, so short context keeps main's row-count aware
         // S=1 and stays byte-identical; only the long-context path, which needs to reproduce AR,
         // pays the pinned-S choice.
-        const bool moe_exact_splitk = (start_pos + N) > kRowwiseMinSeq;
+        //
+        // A packed decode step (packed_pos set, no verify groups) is not a verify chain: its rows
+        // are separate sequences, each one token, and start_pos is only the first row's position.
+        // Nothing there has to reproduce AR bit for bit, and the pinned split count put every
+        // served step past 384 tokens of context on the per-token split-K down (~103 us a layer
+        // at 32 rows, against ~50-60 for the expert-grouped down it then skipped).
+        // SPARKINFER_PACKED_MOE_EXACT=1 pins it there too, as before.
+        static const bool packed_exact = [] {
+            const char* e = getenv("SPARKINFER_PACKED_MOE_EXACT");
+            return e && e[0] == '1';
+        }();
+        // Below 8 rows the pinned split-K down is the faster one anyway (c4 3.95 against 4.03 ms an
+        // ITL; even at c8, 3% behind from c12), so only wider steps leave it.
+        const bool plain_packed = s.packed_pos && s.group_n == 0 && !packed_exact && N >= 8;
+        const bool moe_exact_splitk = !plain_packed && (start_pos + N) > kRowwiseMinSeq;
         if (moe_rowwise && (start_pos + N) > kRowwiseMinSeq) {
             // Give every row its own scratch slice. Sharing moe_h/moe_out across the loop makes the
             // calls false-dependent, so they serialize and the row loop costs ~28% at 4k; sliced,
@@ -7258,7 +7606,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const int v = e ? atoi(e) : 16;
         return v < 1 ? 1 : v;
     }();
-    if (packed && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
+    if (wide && N >= kHeadGemmMinRows && !(N & 7) && s.w.lm_head_fp4 && s.w.lm_head_fp4_sf &&
         fp4_a && fp4_asf) {
         head_ok = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, N, H, st) &&
                   kernels::launch_prefill_nvfp4_gemm_f32(fp4_a, fp4_asf, s.w.lm_head_fp4,
@@ -7371,10 +7719,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         if (q4k_f16 &&
             kernels::launch_mmvq_q4k_f16_rows(xn, s.w.lm_head, logits, true, N, c.vocab, H, st))
             mr_done = true;
-        if (!mr_done && packed && N > 1 &&
+        if (!mr_done && wide && N > 1 &&
             kernels::launch_mmvq_q4k_mma_head_f32(q81, s.w.lm_head, logits, N, c.vocab, H, st))
             mr_done = true;
-        if (!mr_done && cb_head_mr && packed && N > 1) {
+        if (!mr_done && cb_head_mr && wide && N > 1) {
             const size_t q81_row_bytes = kernels::llama_q8_1_bytes(H);
             bool mr_ok = true;
             for (int r0 = 0; r0 < N && mr_ok; r0 += 8) {
@@ -7449,7 +7797,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     }
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
-    graph_warm = true;
+    if (!s.verify_eager) graph_warm = true;
+    if (s.verify_eager) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[prefill] prompt-tail verify arena: %.0f MB\n", graph_cache.arena.total() / 1e6);
+            logged = true;
+        }
+    }
     if (vdbg_dump_now) {
         std::vector<bf16> host((size_t)(c.n_layers + 1) * H);
         pf_cu(cudaMemcpy(host.data(), verify_dbg_buf, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
@@ -7474,8 +7829,32 @@ verify_forward_done:
     // sequence, and the batched GDN block already advanced that session's conv window and
     // recurrent state in place. There is no accepted prefix to select and nothing to commit.
     if (packed) return N;
+    // A sampled request: each row's token is the one sampled decode would draw at that position.
+    // Nothing is committed yet (the KV rows past the accepted prefix are outside the sequence's
+    // length and the GDN state is only replayed below), so declining here leaves the state as it
+    // was.
+    if (s.verify_sample && !s.verify_sample(s.verify_sample_user, logits, N, out_argmax)) {
+        verify_decline("[dflash-verify] row sampling failed (N=%d) -> declined\n", N);
+        return -1;
+    }
     int keep = 1;
+    if (s.verify_commit_all) keep = N;
     while (keep < N && token_ids[keep] == out_argmax[keep - 1]) ++keep;
+    // A grouped verify: each group's accepted prefix, within its own rows.
+    struct CommitUnit { size_t off; int keep; void* conv; float* state; };
+    std::vector<CommitUnit> units;
+    if (grouped) {
+        for (int g = 0; g < s.group_n; ++g) {
+            const int o = s.group_off[g], len = s.group_len[g];
+            int k = 1;
+            while (k < len && token_ids[o + k] == out_argmax[o + k - 1]) ++k;
+            if (s.group_commit_all && s.group_commit_all[g]) k = len;
+            s.group_keep[g] = k;
+            units.push_back({(size_t)o, k, s.group_lin_conv[g], s.group_lin_state[g]});
+        }
+    } else {
+        units.push_back({0, keep, s.lin_conv_state, s.lin_state});
+    }
     if (getenv("SPARKINFER_DFLASH_VERIFY_DUMP_ROW")) {
         fprintf(stderr, "[dflash-verify-debug] start_pos=%d N=%d keep=%d out_argmax=[", start_pos, N, keep);
         for (int i = 0; i < N; i++) fprintf(stderr, "%d ", out_argmax[i]);
@@ -7513,38 +7892,44 @@ verify_forward_done:
         if (!ids.empty() &&
             cudaMalloc(&d_gdn_layers, ids.size() * sizeof(int)) == cudaSuccess &&
             cudaMalloc(&d_gdn_w, wts.size() * sizeof(dflash_kernels::GdnCommitLayer)) == cudaSuccess) {
-            cudaMemcpy(d_gdn_layers, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_gdn_w, wts.data(), wts.size() * sizeof(dflash_kernels::GdnCommitLayer),
+            si_h2d_complete(d_gdn_layers, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
+            si_h2d_complete(d_gdn_w, wts.data(), wts.size() * sizeof(dflash_kernels::GdnCommitLayer),
                        cudaMemcpyHostToDevice);
             n_gdn = (int)ids.size();
             gdn_tbl_key = &s.w;
         }
     }
-    if (commit_layers && n_gdn > 0) {
-        dflash_kernels::launch_gdn_conv_commit_layers(
-            rec_qkv, (size_t)N * lqkv, s.lin_conv_state,
-            (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, keep,
-            c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
-        dflash_kernels::launch_gdn_scan_commit_layers(
-            rec_k, (size_t)N * s.linear_qdim, rec_v, (size_t)N * lvdim,
-            rec_a, (size_t)N * vh, rec_b, d_gdn_w,
-            s.lin_state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
-            n_gdn, keep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
-    } else {
-        for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
-            bf16* rq = rec_qkv + (size_t)L * N * lqkv;
-            bf16* rk = rec_k + (size_t)L * N * s.linear_qdim;
-            bf16* rv = rec_v + (size_t)L * N * lvdim;
-            bf16* ra = rec_a + (size_t)L * N * vh;
-            bf16* rb = rec_b + (size_t)L * N * vh;
-            bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
-                (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            float* state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
-            kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
-                c.linear_head_dim, c.linear_conv_kernel, st);
-            kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
-                s.w.layers[L].ssm_a, state, keep, c.linear_q_heads, vh, c.linear_head_dim,
-                c.gdn_qh_block, st);
+    for (const CommitUnit& u : units) {
+        const size_t uo = u.off;
+        const int ukeep = u.keep;
+        if (commit_layers && n_gdn > 0) {
+            dflash_kernels::launch_gdn_conv_commit_layers(
+                rec_qkv + uo * lqkv, (size_t)N * lqkv, u.conv,
+                (size_t)(c.linear_conv_kernel - 1) * lqkv, d_gdn_layers, n_gdn, ukeep,
+                c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, st);
+            dflash_kernels::launch_gdn_scan_commit_layers(
+                rec_k + uo * s.linear_qdim, (size_t)N * s.linear_qdim,
+                rec_v + uo * lvdim, (size_t)N * lvdim,
+                rec_a + uo * vh, (size_t)N * vh, rec_b + uo * vh, d_gdn_w,
+                u.state, (size_t)vh * c.linear_head_dim * c.linear_head_dim,
+                n_gdn, ukeep, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+        } else {
+            for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+                bf16* rq = rec_qkv + (size_t)L * N * lqkv + uo * lqkv;
+                bf16* rk = rec_k + (size_t)L * N * s.linear_qdim + uo * s.linear_qdim;
+                bf16* rv = rec_v + (size_t)L * N * lvdim + uo * lvdim;
+                bf16* ra = rec_a + (size_t)L * N * vh + uo * vh;
+                bf16* rb = rec_b + (size_t)L * N * vh + uo * vh;
+                bf16* conv_live = static_cast<bf16*>(u.conv) +
+                    (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
+                float* state = u.state +
+                    (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
+                kernels::launch_dflash_gdn_conv_commit(rq, conv_live, ukeep, c.linear_q_heads, vh,
+                    c.linear_head_dim, c.linear_conv_kernel, st);
+                kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,
+                    s.w.layers[L].ssm_a, state, ukeep, c.linear_q_heads, vh, c.linear_head_dim,
+                    c.gdn_qh_block, st);
+            }
         }
     }
     // The next draft block consumes only the captured target hidden rows and the draft model's
@@ -7564,8 +7949,8 @@ verify_forward_done:
     // calibration. The explicit environment setting still wins for cross-context testing.
     const bool async_commit = async_commit_env >= 0 ? async_commit_env != 0
                                                     : (start_pos >= 2048 && start_pos < 6144);
-    if (!async_commit) pf_cu(cudaStreamSynchronize(st), "verify commit");
-    return keep;
+    if (!async_commit || grouped) pf_cu(cudaStreamSynchronize(st), "verify commit");
+    return grouped ? N : keep;
 }
 
 } // namespace sparkinfer

@@ -148,6 +148,37 @@ void launch_temperature_sample(float* logits, int n_rows, int vocab,
                                const float* temp_f32, const unsigned long long* seed_u64,
                                const unsigned long long* step_u64, cudaStream_t stream = nullptr);
 
+// Batched top_k/top_p + temperature sampling of many rows in one launch. For every row it gives
+// the token that launch_topk_topp_mask -> launch_temperature_sample -> launch_argmax, each
+// launched with n_rows = 1 on that row, would give: the same top_k/top_p survivors, the same
+// Philox key (seed, subsequence = vocab id, offset = step) and the same noise arithmetic.
+// `logits` ([n_rows, vocab], fp32) is read-only; per-row parameters are device arrays of n_rows.
+//
+// It handles only the rows sample_rows_topk_eligible() accepts and leaves out_id[row] untouched
+// for every other row, so the caller samples those (greedy, top_k disabled, top_k above
+// kSampleRowsTopkMax) the old way. A handled row writes -1 in the rare case its candidate set
+// overflows (thousands of identical logits at the top_k boundary); sample it the old way too.
+// With overflow_keeps_out, such a row leaves out_id[row] as the caller set it instead.
+//
+// Only the k candidates draw noise (not the whole vocab), and no sort of the vocab is needed.
+// One exception to "the same token": the top_p cut sums the candidates' softmax numerators
+// sequentially where launch_topk_topp_mask uses a CUB scan, so a row whose partial sum lands
+// within float rounding of top_p * total can keep one candidate more or fewer.
+inline constexpr int kSampleRowsTopkMax = 128;
+__host__ __device__ inline bool sample_rows_topk_eligible(float temp, int top_k, int vocab) {
+    return temp > 0.f && top_k >= 1 && top_k <= kSampleRowsTopkMax && top_k < vocab;
+}
+// Each row's top k logits (1 <= k <= kSampleRowsTopkMax, k < vocab) as ids and values, in the
+// order launch_topk_topp_mask's sort gives them (value desc, id asc). A row whose candidate set
+// overflows writes ids of -1.
+void launch_topk_rows(const float* logits, int n_rows, int vocab, int k, int* out_ids,
+                      float* out_vals, cudaStream_t stream = nullptr);
+void launch_sample_rows_topk(const float* logits, int n_rows, int vocab,
+                             const float* temp_f32, const unsigned long long* seed_u64,
+                             const unsigned long long* step_u64, const int* top_k_i32,
+                             const float* top_p_f32, int* out_id, cudaStream_t stream = nullptr,
+                             bool overflow_keeps_out = false);
+
 // top_k / top_p (nucleus) truncation, applied in place BEFORE launch_temperature_sample: masks
 // logits outside the surviving set to -infinity via a full descending sort + cumulative-softmax
 // cutoff (n_rows == 1 only -- decode-time truncation, not a batched prefill/verify operation).
@@ -388,6 +419,7 @@ void launch_qwen36_conv_split_l2norm_part(const float* part, int splits, const v
 // One-off fp32 -> compacted-bf16 conversion of a GDN state array (see qwen36.cu). `staging` must
 // hold n bf16 values; the result lands in the first half of `state`.
 bool launch_qwen36_gdn_state_to_b16(float* state, void* staging, size_t n, cudaStream_t stream);
+bool launch_qwen36_gdn_state_from_b16(float* state, void* staging, size_t n, cudaStream_t stream);
 bool launch_qwen36_gdn_ar_batched(const void* q_bf16, const void* k_bf16, const void* v_bf16,
                                   const void* alpha_bf16, const void* beta_bf16,
                                   const void* dt_bf16, const void* a_bf16,

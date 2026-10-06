@@ -295,9 +295,34 @@ public:
     // returning false stops it between steps -- with the KV and the Gated-DeltaNet state exactly at
     // the committed position, so ordinary decode can take over from SpecResume::position with
     // SpecResume::next_token and produce what the speculative loop would have.
+    struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
+    // Pin the prefix cache's snapshot buffers ahead of serving (see snapshot_pool_warm in qwen35.cpp).
+    void warm_snapshot_pool();
     struct SpecHooks {
         uint64_t seq_id = 0;
+        // A prefix-cache hit: the session's KV for [0, prefill_start) is shared in and its
+        // recurrent state restored there, so prefill covers only the rest. The draft then has the
+        // target's hidden states only from prefill_start on and drafts from those.
+        int prefill_start = 0;
+        // Prefix-cache checkpoints to snapshot during the prefill (ascending, block-aligned,
+        // inside (prefill_start, prompt end)): snaps[i] receives what snapshot_recurrent_state
+        // would return at ckpts[i]. SpecResume::ckpts_taken says whether they were filled.
+        const int* ckpts = nullptr;
+        int n_ckpts = 0;
+        RecurrentStateSnapshot* snaps = nullptr;
         std::function<bool(const int* tokens, int n)> on_tokens;
+        // The request's sampler. temperature <= 0 verifies greedily. Above 0, the first token and
+        // every verified position are drawn as ordinary decode draws them -- top_k/top_p mask,
+        // Gumbel noise from Philox(seed, vocab id, step), argmax -- at step = the token's index in
+        // the response (0 for the first), and a proposal is kept while it equals that draw. A
+        // seeded request therefore produces the same tokens speculated or not.
+        float temperature = 0.f;
+        unsigned long long seed = 0;
+        int top_k = 0;
+        float top_p = 1.f;
+        // The request's ignore_eos: an EOS is emitted like any other token and the run goes on to
+        // max_new_tokens (as SPARKINFER_BENCH_IGNORE_EOS does for the bench binaries).
+        bool ignore_eos = false;
     };
     struct SpecResume {
         bool engaged = false;   // false: nothing ran -- speculation would not pay here, or could not start
@@ -307,6 +332,7 @@ public:
         int next_token = -1;    // the verified token at `position`, not yet emitted nor ingested
         int emitted = 0;        // tokens handed to on_tokens
         bool tier_boundary = false;  // stopped where the next step would cross a KV split tier
+        bool ckpts_taken = false;    // SpecHooks::snaps hold the prompt's checkpoints
     };
     std::vector<int> dflash_generate(const std::vector<int>& prompt_ids, int max_new_tokens,
                                      DFlashStats* stats = nullptr,
@@ -477,6 +503,10 @@ public:
         const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
         const float* top_p = nullptr;                  // [n]; >= 1 is off
     };
+    // Ingest up to 32 tokens -- the 1-7 an aligned prefill leaves over, or a short resumed range --
+    // in ONE forward of the verify path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
+    // the path declined, in which case nothing was committed.
+    int ingest_tail_rows(const int* token_ids, int n, int pos0);
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
     // each session opened with nothing ingested yet, text only, no logit_bias. On success writes
     // each prompt's seed to seeds[i] and returns true: the argmax -- the token
@@ -484,8 +514,15 @@ public:
     // temperature above 0, the token sample_seed_token() draws from the same logits. Returns false
     // when the pack is not eligible or a stage declines; the caller then ingests the prompts one
     // at a time from position 0, which resets whatever this pass had written.
+    //
+    // ckpt_rows (optional, n_prompts entries): a prompt with ckpt_rows[i] > 0 has its recurrent
+    // state snapshotted after that many tokens, as ingest_prompt_checkpointed does for one prompt,
+    // into snaps[i] (same layout as snapshot_recurrent_state). The row must leave at least 16
+    // tokens on each side. A pack whose total is not a multiple of 8 -- which would take every
+    // layer off the NVFP4 GEMMs -- runs one prompt's last 1-7 tokens as decode steps after it.
     bool ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts, const int* lens,
-                               int n_prompts, int* seeds, const PackedSampling* sampling = nullptr);
+                               int n_prompts, int* seeds, const PackedSampling* sampling = nullptr,
+                               const int* ckpt_rows = nullptr, RecurrentStateSnapshot* snaps = nullptr);
     // The response's FIRST token for a sampled request. Prefill's seed is the argmax of the last
     // prompt position; this redraws it from those same logits the way forward_token draws every
     // later token -- top_k/top_p mask, Gumbel-max noise from Philox(seed, vocab index, step), then
@@ -566,8 +603,12 @@ public:
     // (fp32) then lin_conv_state (bf16) -- in pinned host memory, so a cached prefix costs host RAM
     // (~205 MB on Qwen3.8-27B) rather than VRAM. A model with no linear layers has nothing
     // recurrent to carry: its snapshot is empty and both calls succeed.
+    // A snapshot's bytes (qwen35.cpp): filled in pinned memory, where the device copy that fills
+    // it can run asynchronously, then moved to pageable memory off the request path so the pinned
+    // buffer serves the next snapshot. Read only through restore_recurrent_state.
+    struct SnapshotBuffer;
     struct RecurrentStateSnapshot {
-        std::shared_ptr<void> host;   // pinned; state_bytes of lin_state, then conv_bytes
+        std::shared_ptr<SnapshotBuffer> host;   // state_bytes of lin_state, then conv_bytes
         size_t state_bytes = 0;
         size_t conv_bytes = 0;
         size_t bytes() const { return state_bytes + conv_bytes; }
@@ -579,6 +620,8 @@ public:
     // Overwrite seq_id's recurrent state with `snap`, in the fp32 form prefill resumes from. False
     // when the session is unknown or the snapshot was taken from a differently shaped model.
     bool restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap);
+    // A copy of a snapshot's bytes (state, then conv), for diagnostics. Empty if it has none.
+    static std::vector<char> snapshot_bytes(const RecurrentStateSnapshot& snap);
     // Prefill prompt tokens [start, end) of the active session in ONE batched pass that snapshots
     // the recurrent state at each of ckpts[0..n_ckpts) as it goes by (ascending, strictly inside the
     // range): snaps[i] is what snapshot_recurrent_state would have returned there. It replaces a
@@ -617,6 +660,29 @@ public:
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
                        int* out_sampled, const PackedSampling* sampling = nullptr);
+    // MIXED STEP: ONE forward that decodes n_dec packed rows (what decode_packed does for them) and
+    // prefills the next `len` tokens of chunk_seq's prompt at positions pos0.. (what a prefill
+    // pass or resume does for them), every row-wise weight read shared (Qwen35PrefillCtx::mix_n).
+    // out_sampled gets the decode rows' tokens, sampled as decode_packed samples them;
+    // *chunk_seed the argmax at the chunk's last position (the prompt's first token when this is
+    // its last chunk). Returns false having run nothing when the model or batch cannot take it
+    // (Qwen3.8 dense hybrid, int8 KV, no vision/MRoPE/DSpark capture, a chunk session with fp32
+    // state and no logit bias); the caller then runs the decode step and the prefill apart.
+    bool mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
+                    int* out_sampled, const PackedSampling* sampling, uint64_t chunk_seq,
+                    const int* chunk_ids, int pos0, int len, int* chunk_seed);
+    // Several prompts' chunks in one mixed step: chunk c is chunk_ids[c][0, lens[c]) of session
+    // chunk_seqs[c] at positions pos0s[c].. (distinct sessions, none among the decode rows). The
+    // decode rows are sampled into out_sampled as mixed_step does. A chunk with want_seed[c] set
+    // ends its prompt: chunk_seeds[c] receives its first token -- the argmax, or a draw from
+    // chunk_sampling's row c as sample_seed_token would draw it. want_seed null = none (then a
+    // lone chunk takes mixed_step itself). False when the step did not run (nothing moved); a seed
+    // that did not come back is -1.
+    bool mixed_step_multi(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
+                          int* out_sampled, const PackedSampling* sampling, int n_chunks,
+                          const uint64_t* chunk_seqs, const int* const* chunk_ids, const int* pos0s,
+                          const int* lens, const unsigned char* want_seed = nullptr,
+                          int* chunk_seeds = nullptr, const PackedSampling* chunk_sampling = nullptr);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;
@@ -661,6 +727,15 @@ public:
 
     // Attach / detach a DFlash draft model (non-owning). nullptr clears.
     void set_dflash_draft(class DFlashDraftModel* draft);
+    // The attached draft's device memory, stepped off the GPU while nothing speculates and
+    // brought back before a speculation group starts (DFlashDraftModel::offload). Bytes released;
+    // false/0 with no draft or when it cannot.
+    size_t dflash_draft_offload();
+    // A session leaving ordinary decode for a speculation group (adopted without a draft): its
+    // recurrent state back to the fp32 form the grouped verify reads. False if it cannot be.
+    bool spec_adopt_session(uint64_t seq_id);
+    bool dflash_draft_restore();
+    bool dflash_draft_offloaded() const;
 
     // DFlash: capture concat hidden states at target_layer_ids per forward step.
     // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).
@@ -695,9 +770,72 @@ public:
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
                          int* out_argmax, const void* dflash_capture_dst = nullptr);
+    // GROUPED SPECULATIVE VERIFY: one forward over n_groups sequences' verify blocks. Group g's
+    // tokens[g][0..lens[g]) sit at positions start_pos[g].. of session seq_ids[g]; out_ids gets
+    // each row's token (argmax, or drawn with the group's sampler at step sampling->step[g] + i),
+    // rows of all groups laid end to end, and keep[g] the length of group g's accepted prefix,
+    // which is committed into its session (KV and recurrent state) -- the same contract
+    // batched_forward has for one sequence. Hidden-state capture rows (when capture is on) go to
+    // capture_dst in the same row order. Sessions must hold fp32 recurrent state (never packed-
+    // decoded). False, with nothing committed, when the batch cannot be served.
+    // SPEC GROUP: the pieces ContinuousBatchEngine's concurrent speculation drives, one request
+    // per draft slot (DFlashDraftModel::use_slot). spec_group_begin/end bracket a group run
+    // (capture on, a verify-wide hidden-row buffer; then everything released). spec_group_join
+    // prefills one request from prefill_from with hidden-state capture -- taking hooks' prefix-
+    // cache checkpoints as dflash_generate does -- and runs its slot's first draft block over the
+    // prompt context: returns the seed token (drawn with hooks' sampler when it samples; handed to
+    // hooks.on_tokens before that block, which is skipped -- resume->finished -- when on_tokens
+    // returns false) and fills proposals[0..spec_group_depth()), or -1: with resume->engaged the prompt was
+    // prefilled and decodes on from resume->position / next_token; with resume->failed the state
+    // moved and is not trustworthy; with neither, nothing ran.
+    // spec_group_draft runs a slot's next block from the hidden rows its last verify captured.
+    // spec_group_verify verifies every member's block in one pass (verify_grouped; one member
+    // takes the single-sequence graph-cached verify) and commits each accepted prefix.
+    // A join whose prompt ends in a partial 8-row group, while other members are already
+    // speculating: spec_group_join_body prefills only the aligned body [0, *body) (same setup as
+    // spec_group_join, no seed, no draft); the caller verifies the rest of the prompt as that
+    // member's rows in the group's next verify with commit_all, whose last row is the seed, and
+    // spec_group_join_finish then moves those rows' captured hidden states (hidden + row offset)
+    // into the prompt's context and runs the slot's first draft block. -1: not taken, nothing ran.
+    int spec_group_join_body(const std::vector<int>& prompt, int max_new, int slot, const SpecHooks& hooks,
+                             int* body);
+    bool spec_group_join_finish(int slot, int n, int tail_len, const void* tail_hidden, int seed,
+                                float temperature, unsigned long long seed_rng, int top_k, float top_p,
+                                int* proposals);
+    bool spec_group_begin();
+    void spec_group_end();
+    int spec_group_depth() const;
+    int spec_group_reach() const;
+    int spec_group_join(const std::vector<int>& prompt, int max_new, int slot, const SpecHooks& hooks,
+                        SpecResume* resume, int* proposals);
+    bool spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
+                          float temperature, unsigned long long seed_rng, unsigned long long step0,
+                          int top_k, float top_p, int* proposals);
+    // spec_group_draft for n slots in one pass (DFlashDraftModel::forward_blocks): job i drafts
+    // slot slots[i] from hidden rows hidden[i] (th_len[i] of them) with seed seeds[i] at position
+    // pos[i], its sampler at temperature[i] / seed_rng[i] / step0[i] / top_k[i] / top_p[i], into
+    // proposals + i * spec_group_depth(). False -- nothing drafted -- where forward_blocks declines;
+    // the caller drafts per slot.
+    bool spec_group_draft_multi(int n, const int* slots, const void* const* hidden, const int* th_len,
+                                const int* seeds, const int* pos, const float* temperature,
+                                const unsigned long long* seed_rng, const unsigned long long* step0,
+                                const int* top_k, const float* top_p, int* proposals);
+    // lens: rows per member; the one-member verify may cut its block at a KV split tier and then
+    // writes the rows it verified back into lens[0].
+    bool spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks, int* lens,
+                           const int* start_pos, const PackedSampling* sampling, int* out_ids,
+                           int* keep,
+                           const bool* commit_all = nullptr);
+    bool verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
+                        const int* lens, const int* start_pos, const PackedSampling* sampling,
+                        int* out_ids, int* keep, const void* capture_dst = nullptr,
+                        const bool* commit_all = nullptr);
 
 private:
     void invalidate_decode_graph();
+    // Points the draft at the target's embedding and the head it drafts with (dflash_generate and
+    // spec_group_begin, before the draft's first block).
+    void bind_draft_shared_weights();
     // Frees every decode graph parked under a non-active session id (see the parking lot in
     // qwen35.cpp's Impl). Called by invalidate_decode_graph(), which is the "something global
     // changed" path, and as a size backstop.

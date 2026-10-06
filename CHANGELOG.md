@@ -3,6 +3,1388 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+## [0.6.32] — 2026-10-06
+
+**Muse Glimmer at 16 concurrent 8K prompts: 351 tok/s and a 2.5 s first token (was 281 / 9.7 s),
+against llama.cpp's 76 / 7.9 s. sparkinfer now leads llama.cpp on every measured Muse Glimmer
+axis, including 32K-120K prompts (first token 3.6-4.2x sooner).**
+
+### Performance
+
+- **Muse Glimmer's KV pool grows into 4 GiB of headroom instead of 6.** The extra 2 GiB went to the
+  NVFP4 down / o copies the prefill builds beside its first pass, which buy little here: with 4 GiB
+  it keeps 39 of 52 downs and 1 of 52 o projections and 8K prompts prefill as fast (196 tok/s at 4
+  requests), while the pool holds 151K tokens instead of 72K at `--ctx 32768`. AIPerf 8K prompts at
+  16 requests: 281 -> 351 output tok/s, TTFT p50 9.7 -> 2.5 s (llama.cpp `436f6f8` on the same GGUF:
+  76 tok/s, 7.9 s); chat at 4 / 16 / 32 requests 274 / 663 / 838 -> 274 / 665 / 847.
+  `SPARKINFER_KV_HEADROOM_GIB` still sets it for any model.
+
+## [0.6.31] — 2026-10-06
+
+**Muse Glimmer serves 8K prompts 1.8-2.5x faster: its KV cache is int8 by default, so twice as many
+long requests fit. Against llama.cpp on the same GGUF, sparkinfer leads every Muse Glimmer serving
+cell (1.4-3.7x).**
+
+### Performance
+
+- **Muse Glimmer takes an int8 KV cache by default.** It was held on bf16 after #779 (garbage from
+  the first decode token), whose cause -- the int8 pool receiving bf16 writes -- #1006 fixed; the
+  carve-out outlived it and halved the pool. Teacher-forced over 6,200 tokens of real text,
+  perplexity 15.365 bf16 against 15.368 int8 (top-1 0.4589 / 0.4591). The pool now holds 72K
+  tokens instead of 33K at `--ctx 32768`. AIPerf (reasoning counted), output tok/s bf16 -> int8:
+  chat c4 / c16 / c32 280 / 692 / 761 -> 274 / 663 / 838; 8K prompts c4 / c16 110 / 112 -> 196 /
+  281, TTFT p50 at 8K c16 30.7 -> 9.7 s. llama.cpp `436f6f8` on the same GGUF: 189 / 363 / 411,
+  89 / 76. `SPARKINFER_KV_INT8=0` keeps bf16.
+
+### Fixed
+
+- **`qwen3_gguf_score` sizes its KV for the sequence it is given.** It allocated 2,048 tokens
+  unless `SPARKINFER_SCORE_MAX_SEQ` was set, so a longer sequence wrote past its blocks and read
+  as a model failing past 2K (Muse Glimmer: perplexity 15 -> 1,000+ beyond position 2048).
+
+## [0.6.30] — 2026-10-06
+
+**Speculative decoding now runs in fixed-length benchmarks: a request with `ignore_eos` speculates.
+Through AIPerf with the DFlash2 draft, 1 / 4 / 8 requests run 227 / 578 / 785 tok/s, against
+196 / 381 / 426 for vLLM 0.30.0 with the same draft.**
+
+### Fixed
+
+- **A request with `ignore_eos` speculates.** Since 0.6.8 (#1265) `spec_eligible` refused it,
+  because the speculative paths only knew the process-wide `SPARKINFER_BENCH_IGNORE_EOS`. Every
+  fixed-length benchmark sets `ignore_eos` (AIPerf, vLLM's and SGLang's bench tools), so a server
+  with a draft loaded decoded those requests token by token, while vLLM speculates through them.
+  The request's flag now rides `SpecHooks` into `dflash_generate` and the group's emit, bonus-token
+  and handover EOS tests: an EOS is emitted like any other token and decoding runs to `max_tokens`.
+  Lossless: plain against draft, `SPARKINFER_DETERMINISTIC=1` and the prefix cache off, four prompts
+  at T=0 and T=0.7, each with and without `ignore_eos`: 16 of 16 completions identical (the
+  `ignore_eos` ones run past the model's own EOS, "Say hi." 41 -> 400 tokens).
+- **Measured** (Qwen3.8-27B NVFP4 + z-lab DFlash2, AIPerf streaming chat 1024 / 256, T=0.7,
+  top_k 20, top_p 0.95, `ignore_eos`, output tok/s at 1 / 2 / 4 / 8 requests): 96 / 183 / 321 /
+  554 -> **227 / 385 / 578 / 785**; vLLM 0.30.0 with the same draft 196 / 313 / 381 / 426. On
+  ShareGPT prompts (their own answer lengths): **193 / 354 / 581 / 533** against vLLM's 163 / 237 /
+  338 / 346 (plain decode 100 / 186 / 313 / 435). Draft loaded, AIPerf default sampling, chat 4
+  requests 322 -> 577, 8K prompts at 4 requests 190 -> 235; at 16-32 requests (past the group size,
+  where the draft steps off the device) 885 / 1,275 -> 864 / 1,234, 8K c16 273 -> 269.
+
+## [0.6.29] — 2026-10-05
+
+**Long-prompt prefill +4-8% on both models (a 2.2x faster Gated-DeltaNet scan). In one same-day
+run against vLLM 0.30.0, sparkinfer leads all ten serving cells on both Qwen3.6 and Qwen3.8.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, RTX 5090, vLLM on the
+  same box the same hour): Qwen3.6-35B-A3B UD-Q4_K_M 976 / 1,769 / 2,405 output tok/s at 4 / 16 /
+  32 requests, 8K prompts 588 / 674 (vLLM on nvidia NVFP4: 669 / 1,695 / 2,364; 452 / 654).
+  Qwen3.8-27B NVFP4 (`--ctx 32768`, no drafter) 323 / 914 / 1,288, 8K 193 / 312 (vLLM 272 / 867 /
+  1,246; 189 / 308).
+
+### Performance
+
+- **The Gated-DeltaNet prefill scan keeps each warp's state columns in registers**
+  (`pf_gdnc_scan_mma_kernel`). A warp owns 16 columns of S as m16n8 accumulators and runs all four
+  chunk products on `mma.sync` straight from them, so a chunk costs one block barrier (the
+  double-buffered cp.async staging) instead of seven plus three shared-memory round trips. Per
+  layer at 8K tokens, prep + scan: Qwen3.8 (48 v-heads) 1,628 -> 1,008 us, Qwen3.6 (32) 1,177 ->
+  849 us. Prefill 1K / 4K / 8K: Qwen3.6 26.2K / 38.5K / 39.3K -> 27.2K / 40.4K / 41.3K tok/s,
+  Qwen3.8 12.5K / 16.1K / 15.4K -> 13.5K / 17.1K / 16.2K. Not bit-identical (M U runs as hi + lo
+  bf16 products, the S update accumulates into the decayed state); against an fp64 run of the
+  recurrence both forms land at the same distance, and `qwen3_gguf_prefill_check` over four
+  real-text slices is level (KL against the token path 0.0111 -> 0.0118 on Qwen3.6, 0.0108 ->
+  0.0099 on Qwen3.8). `SPARKINFER_PREFILL_GDN_SCAN_MMA=0` restores the block form.
+
+## [0.6.28] — 2026-10-05
+
+**Qwen3.6 serving at 32 chat requests +5%, now level with vLLM (2,366 tok/s each), with a 45%
+faster first token. sparkinfer now matches or beats vLLM in every Qwen3.6 serving cell.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090, two runs each): 973 / 1,749 / 2,366 output tok/s at 4 / 16 / 32 requests,
+  8K-token prompts 575 / 664 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4, same box and harness: 661 /
+  1,689 / 2,366; 451 / 652). TTFT p50 at 32 requests 318 ms against vLLM's 580. Qwen3.8 unchanged.
+
+### Performance
+
+- **A burst of Qwen3.6 prompts is prefilled in packed passes.** At 32 concurrent chat requests
+  AIPerf's closed loop starts every wave with ~32 prompts and nothing decoding, and on Qwen3.6
+  each of them ran a pass of its own: a prompt-only burst (32 x 1K tokens, one output token) ran
+  18.9 requests/s against vLLM's 37.4. Four things kept it out of the pack: the packed ingest
+  required a dense FFN and the batched pass refused an MoE pack without decode rows (the routed
+  FFN is per row; `SPARKINFER_PACK_MOE=0` restores both); a chat prompt's prefix-cache checkpoint
+  sits ~12 tokens before its end, under the pack's 16-token margin (now moved back a block -- the
+  next turn still matches it); checkpointed prompts ran their GDN conv / scan and snapshot copies
+  serially on the pass's stream (now on their segment streams); and each snapshot pinned a fresh
+  host buffer mid-pass (~1 s of a 4 s burst window in cudaHostAlloc). The snapshot pool is now
+  sized in bytes (`SPARKINFER_SNAPSHOT_POOL_MB`, 4096), warmed when the prefix cache is enabled,
+  and a packed pass takes its buffers from it only (a prompt without one skips its checkpoint).
+  Prompt-only burst 18.9 -> ~30 requests/s. Served chat (AIPerf, two runs) c4 / c16 / c32 944 /
+  1,739 / 2,246 -> 973 / 1,749 / 2,366 output tok/s, TTFT p50 at c32 385 -> 318 ms; 8K c4 / c16
+  574 / 665 -> 575 / 664. `pack_ckpt_check` now opens GGUF checkpoints and passes on Qwen3.6
+  and Qwen3.8 (same seeds alone and packed).
+
+- **The pipelined routed MoE GEMM takes one barrier a K step instead of two**: the next activation
+  step is issued after the step's own barrier (which already proves every warp is past the slot
+  being refilled), so the barrier at the bottom of every step goes. Phase timing (clock64) had the
+  K loop at ~470 cycles a step for a handful of MMAs. 1K-token step: gate / up 128 -> 125 us, down
+  156 -> 147 us; Qwen3.6 prefill 1K / 2K 25.4K / 33.0K -> 26.1K / 33.7K tok/s. Same values.
+
+## [0.6.27] — 2026-10-05
+
+**Qwen3.6 serving +3-10%: its routed expert downs are read at 4.5 bits a weight instead of 5.5.
+sparkinfer now leads vLLM in four of five Qwen3.6 serving cells, and trails only at 32 chat
+requests (by ~5%).**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 944 / 1,739 / 2,246 output tok/s at 4 / 16 / 32 requests, 8K-token prompts
+  574 / 665 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4, re-measured the same day: 661 / 1,689 / 2,366;
+  451 / 652). Qwen3.8 unchanged.
+
+### Performance
+
+- **Qwen3.6's routed expert downs are refit from Q5_K to Q4_K at load**, so each routed down read
+  is 4.5 bits a weight instead of 5.5 -- the size an NVFP4 expert pool reads -- and the batched
+  decode groups them by expert with a new Q4_K kernel (down_q4k_group_qwen_kernel, the Q5_K one's
+  twin). Lossy, like the default Q8_0 -> Q4_K attention refit this checkpoint already gets: over
+  three 4K-token corpus slices perplexity moved -1.7 / -0.3 / +1.7% and next-token agreement -0.2 /
+  -0.2 / -0.1 points. Served chat (AIPerf, distinct prompts) c4 / c16 / c32 918 / 1,697 / 2,188 ->
+  948 / 1,745 / 2,281 output tok/s (two runs each), 8K prompts c4 / c16 524 / 646 -> 574 / 662.
+  On for the Qwen3.5/3.6 hybrid-MoE fingerprint; `SPARKINFER_MOE_DOWN_REQUANT_Q4K=0` keeps the
+  GGUF's tensor (and `qwen3_gguf_score` sets that, so teacher-forced scoring still reads the
+  checkpoint as shipped), `=1` turns it on for other MoE checkpoints.
+
+## [0.6.26] — 2026-10-05
+
+**Qwen3.6 prompt processing on 1-2K-token steps +5-8%: the pipelined routed MoE GEMM covers the
+64-row tiles too and keeps 3-4 activation steps in flight. Serving is now level with vLLM on 8K
+prompts at 16 requests and ahead at 16 chat requests.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 918 / 1,701 / 2,222 output tok/s at 4 / 16 / 32 requests (c32 2,152 in a
+  second run), 8K-token prompts 522 / 652 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 /
+  2,367; 450 / 652). Prefill 1K / 2K / 4K / 8K 24.5K / 32.0K / 37.5K / 38.5K tok/s.
+
+### Performance
+
+- **The pipelined m16n8k32 routed MoE GEMM also takes 64-row tiles**, the shape the caller builds
+  for 512-2048-token prefills and mixed steps, which ran on the bm16-family kernel: at a 1K-token
+  step gate / up 150 -> 139 us and the Q5_K down 229 -> 210 us a layer. Eight warps sit 2 x 4 (32
+  rows x 16 columns) instead of 4 x 2; same tilemap, int8 bytes and int32 sums, bf16 output
+  bit-identical (the GPU test now covers both tile heights). Qwen3.6 prefill 1K / 1.5K / 2K
+  22.9K / 26.3K / 29.5K -> 24.2K / 27.6K / 31.0K tok/s; served chat c16 / c32 even with 0.6.25
+  (1,698 / 2,220 against 1,693 / 2,215, which already had the 128-row kernel).
+  `SPARKINFER_PREFILL_MOE_K32=0` keeps both tile heights on the previous kernels.
+- **That kernel keeps three (128-row) or four (64-row) activation K-steps in flight instead of
+  one.** Its MMAs per step are too short to cover the next step's L2 fetch, so with two buffers
+  every step waited it out -- sixteen times a tile at the down's K=512. At a 1K-token step gate /
+  up 139 -> 128 us, down 210 -> 195 us; prefill 1K / 2K / 4K 24.2K / 31.0K / 37.1K -> 24.5K /
+  32.0K / 37.5K tok/s. Same values, same order.
+
+## [0.6.25] — 2026-10-05
+
+**Gated-DeltaNet prompt processing: the chunked scan ~19% and its prep kernel ~13% faster, output
+bit-identical. Qwen3.8 serving now leads vLLM in every cell.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, RTX 5090):
+  Qwen3.6-35B-A3B UD-Q4_K_M 910 / 1,693 / 2,215 output tok/s at 4 / 16 / 32 requests, 8K-token
+  prompts 520 / 645 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367; 450 / 652);
+  Qwen3.8-27B NVFP4 314 / 908 / 1,259, 8K 188 / 310 (vLLM 271 / 862 / 1,239; 187 / 306).
+
+### Performance
+
+- **The chunked Gated-DeltaNet prefill scan fetches each chunk's gates, U0 and M a chunk ahead.**
+  The scan walks a prompt's 32-token chunks serially, and each chunk began with plain global loads
+  of those three tiles, so every step of the chain waited out a memory round trip before its first
+  barrier. They now come into registers at the end of the previous chunk, beside the W / K / Q
+  cp.async that was already issued there (shared memory has no room for a second plane at two
+  blocks an SM). Same values into the same slots: bit-identical (Qwen3.6 teacher-forced scoring
+  over 1,499 positions matches exactly). Scan per layer at 8K tokens 1,057 -> 882 us.
+- **The GDN prep kernel stages K / Q sixteen bytes a load, and starts V streaming as soon as Q is
+  done with** (behind the triangular solve and W^, instead of after them). Same values:
+  bit-identical. Prep per layer at 8K tokens 390 -> 341 us.
+- **The GDN scan forms both per-row decays once per chunk, in the warp holding the gates, and
+  scales U~ in the same pass that narrows it for the state update** -- three fewer block barriers a
+  chunk. Bit-identical. Scan per layer at 8K tokens 882 -> 858 us.
+- Together: Qwen3.6 prefill 8K 37.1K -> 38.4K tok/s, 2K 29.0K -> 29.7K.
+
+## [0.6.24] — 2026-10-05
+
+**Qwen3.6 prompt processing ~10% faster: the routed MoE prefill GEMM is pipelined and on the
+m16n8k32 tensor-core path. Serving now matches vLLM at 16 concurrent requests and is within 1% on
+8K prompts.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 911 / 1,688 / 2,224 output tok/s at 4 / 16 / 32 requests (0.6.23: 903 /
+  1,666 / 2,193; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 520 / 646 at
+  4 / 16 (vLLM 450 / 652), TTFT p50 916 ms at 16. Single-prompt prefill 4K / 8K 36.3K / 37.0K
+  tok/s.
+
+### Performance
+
+- **The routed MoE GEMM a prefill (and a served mixed step) runs at 3K+ tokens is pipelined and on
+  m16n8k32.** pfm_moe_gemm_qi8_kernel decoded each weight super-block straight from global, waited
+  at a barrier, then ran wmma 16x16x16: the DRAM read was serialized against the tensor cores, and
+  at a served mixed step's 4096 tokens its gate / up ran at ~165 int8 TOPS. The new kernel takes the
+  dense prefill GEMM's recipe -- a second weight plane, the next super-block fetched into registers
+  before the MMAs and decoded after (now for Q5_K too), m16n8k32 through ldmatrix -- and scatters
+  the down projection with 4-wide vector reductions (a quarter of the atomics). Per layer at 4096
+  tokens: gate / up 395 -> 279 us each, Q5_K down 493 -> 401 us. Single-prompt prefill 4K / 8K
+  32.3K / 34.0K -> 36.3K / 37.0K tok/s. Qwen3.6 served chat (AIPerf, distinct prompts) c16 / c32
+  1,653 / 2,162 -> 1,690 / 2,231 output tok/s; 8K prompts c4 / c16 504 / 619 -> 519 / 646, TTFT p50
+  978 -> 912 ms at c16. Output bit-identical for the gate / up (int32 accumulation, same int8
+  bytes); the scattered down sums the same products in atomic order as before. New GPU test
+  `moe_qi8_k32_gpu_test`. `SPARKINFER_PREFILL_MOE_K32=0` restores the previous kernel.
+  With it, 128-row tiles win from 2048 tokens instead of 3072 (prefill at 3072 tokens 30.3K ->
+  34.5K tok/s); `SPARKINFER_PREFILL_MOE_BM64_MAX` moves that crossover.
+
+## [0.6.23] — 2026-10-05
+
+**Qwen3.6 serving at 32 concurrent requests +17% (1,868 -> 2,193 output tok/s), now within 7% of vLLM
+on its NVFP4 checkpoint and level at 16.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 903 / 1,666 / 2,193 output tok/s at 4 / 16 / 32 requests (0.6.22: 908 /
+  1,559 / 1,868; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 503 / 619 at
+  4 / 16 (vLLM 450 / 652). Qwen3.8 unchanged.
+
+### Performance
+
+- **A served packed decode step no longer pins the MoE down projection to its exact-reproduction
+  split.** `dflash_verify_short_run` carries both the speculative verify and plain packed decode,
+  and once a step's first row passed 384 tokens of context it pinned the down's split count the
+  way a long verify chain must to reproduce AR. That put every served Qwen3.6 step on the per-token
+  split-K down (~103 us a layer at 32 rows) and skipped the expert-grouped down. A plain packed
+  step (separate sequences, one token each, 8+ rows) now takes the row-count-aware path; verify
+  chains and grouped verify keep the pin. Qwen3.6 served chat (AIPerf, distinct prompts) c16 / c32
+  1,586 / 1,939 -> 1,666 / 2,193 output tok/s, 8K c16 598 -> 619; c4 and Qwen3.8 unchanged.
+  `SPARKINFER_PACKED_MOE_EXACT=1` restores the pin.
+- **A packed batch's row GEMVs run their 8-row chunks as one launch** (bf16 row GEMV and the Q8_0
+  row MMVQ). Each chunk alone launches N / RPB CTAs -- 128 for Qwen3.6's 256-expert router, 512 for
+  its attention k / v -- and at 32 rows four of them ran back to back on the critical path. The
+  chunk index now rides on grid.y; every row computes the same bits (new GPU test
+  `gemv_rows_fuse_gpu_test`). `SPARKINFER_GEMV_ROWS_FUSE=0` restores a launch per chunk.
+- **The grouped MoE gate/up takes an expert's pairs at most four to a warp**, so a popular expert is
+  spread over several warps instead of one warp's serial passes: 97 -> 92 us a layer at c32.
+- Together: Qwen3.6 `cb_bench` c32 ITL 11.61 -> 11.29 ms, c16 7.52 -> 7.44 ms; served chat (AIPerf,
+  distinct prompts) c16 / c32 1,559 / 1,868 -> 1,586 / 1,939 output tok/s. Qwen3.8 unchanged.
+
+## [0.6.22] — 2026-10-05
+
+**Qwen3.6 serving at 32 concurrent requests +5%: the routed MoE reads each expert's weights about
+once per decode step instead of once per token routed to it.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 908 / 1,559 / 1,868 output tok/s at 4 / 16 / 32 requests (0.6.21: 903 /
+  1,564 / 1,773; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 502 / 602 at
+  4 / 16 (vLLM 450 / 652).
+
+### Performance
+
+- **Qwen3.6's routed MoE reads each expert's weights about once per batched decode step, not once
+  per token routed to it.** At 32 concurrent requests a step's 256 (token, slot) pairs land on ~84
+  distinct experts in served chat traffic, but the gate/up and down kernels gave every pair its own
+  warps, so an expert's rows came from DRAM about three times. From 20 rows a step, one small
+  kernel counting-sorts the pairs by expert; the gate/up then runs a warp per (expert, 4 rows) over
+  all of that expert's pairs, and the Q5_K down does the same and sums each token's eight weighted
+  terms in slot order in a separate pass. Per layer at c32 (`cb_bench` corpus routing): gate/up
+  117 -> 95 us, down 69 -> 62 + 2 us; `cb_bench` c32 ITL 13.02 -> 11.62 ms. Served chat c32
+  1,772 -> 1,868 output tok/s; c4 / c16 and 8K prompts unchanged. The gate/up output is
+  bit-identical to the per-pair kernel; the down sums the same terms in another order (within bf16
+  rounding, deterministic). New GPU test `moe_gate_up_group_gpu_test`.
+  `SPARKINFER_MOE_GU_ROWS_MIN` (default 20) sets the row floor, `SPARKINFER_MOE_GU_SORT=0` /
+  `SPARKINFER_MOE_DOWN_GROUP=0` keep the per-pair kernels.
+
+## [0.6.21] — 2026-10-04
+
+**Batched decode on Q4_K GGUFs: the dense projections run ~1.3-1.5x faster at 16-32 rows.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 903 / 1,564 / 1,773 output tok/s at 4 / 16 / 32 requests (0.6.20: 906 /
+  1,517 / 1,716; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 501 / 599 at
+  4 / 16 (vLLM 450 / 652).
+
+### Performance
+
+- **Packed Q4_K row projections load both operands straight into registers, 32 weight rows a
+  warp** (#1299). The tensor-core rows kernel staged each CTA's tiles through shared memory for a
+  single super-block -- ~75% of its time at 32 rows -- and ran at 360-480 GB/s. The new kernel
+  keeps two m16n8k32 weight tiles per warp across whole super-blocks with no shared memory or block
+  barrier: 8192 x 2048 at 32 rows 19.7 -> 13.3 us, 2048 x 4096 13.2 -> 8.7 us; faster at 8-32 rows.
+  Same fold-in and accumulator, output within bf16 rounding of the exact MMVQ.
+  `cb_bench` c32 ITL: Qwen3.6 12.28 -> 11.87 ms, Qwen3.8 UD GGUF 26.04 -> 25.02 ms.
+  `SPARKINFER_Q4K_MMA2=0` keeps the staged kernel.
+- **The tensor-core split-K slot covers a 32-row FFN gate / up** (#1300): Qwen3.8's 17408-wide and
+  Muse Glimmer's 19968-wide projections ran as two 16-row launches, each reading the weight; now one
+  (17408 x 5120 at 32 rows: 76 -> 55.5 us).
+
+### Tools
+
+- **`q4k_rows_bench`** (#1298) times the packed-decode Q4_K row projections DRAM-cold at Qwen3.6
+  or Qwen3.8 (`Q4K_BENCH_SHAPES=q38`) shapes; `Q4K_BENCH_CHECK=1` compares against the exact MMVQ.
+
+## [0.6.20] — 2026-10-04
+
+**Qwen3.6 serving at 16 / 32 concurrent requests +12% / +13%: bigger mixed steps for MoE models and
+the shared expert on the int8 tensor cores.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, a distinct prompt set per cell,
+  Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): 906 / 1,517 / 1,716 output tok/s at 4 / 16 / 32 requests
+  (0.6.19: 902 / 1,355 / 1,523). vLLM 0.30.0 on nvidia/Qwen3.6-35B-A3B-NVFP4, same workload:
+  666 / 1,686 / 2,367 -- it still leads at 16 and 32 requests; sparkinfer leads at 4 and on
+  8K-token prompts at 4 (494 vs 450).
+
+### Performance
+
+- **An MoE model's mixed steps carry up to 4096 prompt tokens** (#1294). A mixed step's prompt
+  chunk routes to nearly every expert, so the step streams the whole expert set (~19.5 GB on
+  Qwen3.6) whatever its size; at the 1024-token budget that was paid per 1K prompt tokens. Dense
+  models keep 1024; `SPARKINFER_MIXED_CHUNK` overrides both. Chat c16 / c32 1,355 / 1,523 ->
+  1,468 / 1,654 tok/s.
+- **Qwen3.6's Q8_0 shared expert runs a packed step's 9-32 rows on the int8 tensor cores**
+  (#1295). The rows kernels walked every row's activation past each weight block one dependent dot
+  at a time -- ~110 us a layer, 4.4 ms of GPU time in a 32-row step. `mma.m16n8k32` takes 16 rows x
+  8 outputs x one Q8_0 block per instruction; the block dots are exact and the split-K partials sum
+  in a fixed order. `cb_bench` c32 ITL 13.0 -> 12.2 ms; serving c16 / c32 1,468 / 1,654 -> 1,517 /
+  1,716. `SPARKINFER_SHEXP_MMA=0` keeps the rows kernels.
+- **The prefill arena is kept up to 2 GB** (#1296), so those 4096-token mixed passes (up to ~1.8 GB
+  of scratch on Qwen3.6) stop handing it back and re-allocating it every pass: 130 of 461 passes
+  did, ~1,800 device-syncing `cudaFree` calls a run. `SPARKINFER_PREFILL_ARENA_KEEP_MB` moves the
+  limit.
+
+## [0.6.19] — 2026-10-04
+
+**Fix: a request with token ids outside the model's vocabulary no longer takes the server down.**
+
+### Fixes
+
+- **Out-of-vocabulary token ids are refused with a 400 instead of losing the CUDA context**
+  (#1292). The embedding kernels index the table by token id unchecked, so an id past the last
+  row read beyond it: an illegal address that killed the device context, after which every
+  request failed until a restart. A server started with another model's tokenizer hits it on
+  the first request -- Muse Glimmer (202,048 rows) with Qwen3.8's tokenizer (248K ids) crashed
+  on AIPerf's first prompt. Requests are now checked against the vocabulary when they are
+  submitted; the offending one gets `400`, the server keeps serving.
+
+## [0.6.18] — 2026-10-04
+
+**Qwen3.8 serving: the KV pool takes the device memory left free after startup. 16 concurrent
+8K-token prompts 159 -> 303 tok/s (TTFT p50 21.4 -> 1.6 s); chat at 32 requests 1,027 -> 1,260.**
+- **Now** (AIPerf streaming, `ignore_eos`, 256-token answers, Qwen3.8-27B NVFP4, `--ctx 32768`,
+  no speculation either side, RTX 5090), output tok/s against vLLM 0.30.0 on the same checkpoint:
+  chat (1K prompts) 321 / 900 / 1,260 vs 271 / 862 / 1,239 at 4 / 16 / 32 requests; 8K prompts
+  204 / 303 vs 187 / 306 at 4 / 16.
+
+### Performance
+
+- **The server's KV pool grows into the device memory left free once the target, draft and
+  vision tower are loaded** (#1290). It was sized to exactly one `--ctx` -- 32K tokens at
+  `--ctx 32768` -- which admits about three concurrent 8K-token requests while ~10 GiB of a 32 GB
+  card sits unused, so 16 concurrent 8K prompts queued for over 20 s. The idle pool is re-sized
+  before the first request to leave `SPARKINFER_KV_HEADROOM_GIB` (default 6) free for the
+  packed-decode graphs and batched-prefill scratch, and the prefix cache is rebuilt around it:
+  32,896 -> 153,904 tokens on Qwen3.8-27B at `--ctx 32768`. `SPARKINFER_KV_GROW=0` keeps the
+  `--ctx`-sized pool. A 4 GiB headroom (215K tokens) measured no better and peaked at 32.1 GB.
+  - **Measured** (before -> after, tok/s): chat c16 829 -> 900, c32 1,027 -> 1,260 (TTFT p50
+    1,358 -> 370 ms); 8K c4 153 -> 204, c16 159 -> 303.
+
+### Tools
+
+- **`SPARKINFER_CB_BENCH_DISTINCT=1`** gives every `qwen3_gguf_cb_bench` stream its own prompt
+  (#1289). With the shared prompt, greedy decoding keeps all rows identical, so an MoE step routes
+  every row to the same experts and looks cheaper than real traffic (Qwen3.6 c16 2,246 vs 1,946
+  tok/s). **`NVFP4_BENCH=1 nvfp4_gemm_check`** times the block-scaled GEMM at Qwen3.8's shapes with
+  DRAM-cold weights.
+
+## [0.6.17] — 2026-10-04
+
+**Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs a
+packed step's rows in one pass.**
+- **Now:** AIPerf streaming chat (1024 / 256, `ignore_eos`) 1,294 / 1,374 output tok/s at 16 / 32
+  requests (0.6.16: 1,251 / 1,332; llama-server on the same GGUF: 372 / 404). Outputs unchanged.
+
+### Performance
+
+- **Qwen3.6 batched decode +10% / +7% at 16 / 32 concurrent requests: the shared expert runs its
+  rows in one pass.** A packed step's shared expert went eight rows at a time -- at 32 rows four
+  launch triples (gate/up, quantize, down) per layer, each re-reading the shared expert's weights
+  and paying its own setup: 2.8 ms of a 14 ms step. It now takes one 16 / 24 / 32-row triple for
+  the bulk and the exact small kernels for the rest. Each row's dots are computed alone, in the
+  same order, so every output is unchanged. `SPARKINFER_SHEXP_ROWS_WIDE=0` restores the 8-row
+  chunks; `SPARKINFER_SHEXP_ROWS_MAX=16|24` caps the width.
+  - **Measured** (`qwen3_gguf_cb_bench`, Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): c16 1,938 -> 2,138,
+    c32 2,196 -> 2,340 tok/s; `packed_decode_check` at 16 / 24 rows matches one forward per row.
+
+## [0.6.16] — 2026-10-04
+
+**Qwen3.6 short-prompt prefill another +5% at 128 tokens: Q4_K weights quantize in place too.**
+- **Now:** 6,963 / 16,903 / 23,578 tok/s at 128 / 512 / 1K tokens (0.6.10: 4,284 / 11,092 /
+  18,051; llama.cpp on the same GGUF: 3,499 / 9,438 at 128 / 512). Bit-identical output.
+
+### Performance
+
+- **The GDN chunk scan uses 16-column blocks when the 32-column grid does not fill the device**
+  (#1284): Qwen3.6's 32 v-heads x 4 = 128 blocks left a quarter of the 170 SMs idle. Bit-identical;
+  +0.4-0.9% prefill. `SPARKINFER_PREFILL_GDN_SCAN_THIN=0` keeps the old shape.
+
+- **Qwen3.6 short-prompt prefill +5% / +2% more (128 / 512 tokens): Q4_K weights also quantize to
+  fp8 in place.** The fp8 projection path still dequantized its Q4_K weights (Qwen3.6's attention
+  q / o, refit to Q4_K at load: 110 tensors a prefill) to bf16 first.
+  `launch_prefill_quantize_rows_fp8_gguf` now reads Q4_K too, computing each value with the
+  coalesced dequant's expression (`deq_q4k_lane8`) in a TU built with the same flags; with
+  `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is identical to the bit on Qwen3.6 and
+  Qwen3.8.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 6,635 / 16,540 / 23,370 ->
+    6,963 / 16,903 / 23,578 tok/s at 128 / 512 / 1K tokens.
+
+## [0.6.15] — 2026-10-04
+
+**Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.**
+- **Now:** 16,540 / 23,370 / 27,342 tok/s at 512 / 1K / 2K tokens (0.6.14: 15,396 / 20,953 /
+  ~26,300; llama.cpp on the same GGUF: 9,438 at 512). Bit-identical output.
+
+### Performance
+
+- **Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.** The
+  routed MoE GEMM gave each expert one block per 16 of its tokens (one per 128 above 512 tokens),
+  and every block decodes and reads that expert's whole weight slice. At 512 tokens an expert
+  averages 16 tokens, so ~43% of experts took two blocks and read their weights twice. The fused
+  quantized GEMM now runs 32-row tiles up to 512 tokens and 64-row tiles up to 3,072 -- two or four
+  16-row MMA tiles sharing every decoded super-block -- whenever it covers all three weights of
+  every layer (otherwise the 16 / 128-row paths are unchanged). Per-row arithmetic is the same: with
+  `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is identical to the bit.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 15,396 / 20,953 / ~26,300 ->
+    16,540 / 23,370 / 27,342 tok/s at 512 / 1K / 2K tokens; 128 and 4K+ unchanged.
+    `SPARKINFER_PREFILL_MOE_BM=16|32|64|128` pins the height.
+
+## [0.6.14] — 2026-10-04
+
+**Qwen3.6 short-prompt prefill another +12% / +8%: Q8_0 weights quantize in place.**
+- **Now:** 6,615 / 15,396 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092, so +54% / +39% in
+  five releases; llama.cpp on the same GGUF: 3,499 / 9,638). Bit-identical output.
+
+### Performance
+
+- **Qwen3.6 short-prompt prefill +12% / +8% more (128 / 512 tokens): Q8_0 weights quantize in
+  place.** Every prefill dequantized each Q8_0 projection weight (the GDN / attention projections
+  and the shared experts, 140 tensors) to a bf16 copy and then quantized that copy to fp8 or int8
+  rows. Two new kernels read the Q8_0 blocks directly and produce the same bf16 values in
+  registers, then the same row scale and rounding (`launch_prefill_quantize_rows_fp8_gguf`,
+  `launch_prefill_quant_rows_q80`): with `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is
+  identical to the bit with them on or off.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,886 / 14,309 / 19,931 / 30,297
+    -> 6,615 / 15,396 / 20,953 / 30,863 tok/s at 128 / 512 / 1K / 4K tokens (llama.cpp on the same
+    file: 3,499 / 9,638 at 128 / 512). `SPARKINFER_FP8_QUANT_GGUF=0` /
+    `SPARKINFER_PREFILL_QUANT_GGUF=0` restore the bf16 round trips.
+
+## [0.6.13] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill another +6.5% / +4.3%: the router GEMM splits K.**
+- **Now:** 5,898 / 14,287 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092; llama.cpp on the same
+  GGUF: 3,499 / 9,638).
+
+### Performance
+
+- **Qwen3.6 short-prompt prefill +6.5% / +4.3% more (128 / 512 tokens): the router GEMM splits K.**
+  At 512 tokens the tensor-core router-logits GEMM was 16 blocks on 170 SMs, each walking all
+  2,048 of K serially: 43 us a layer. Up to 2,048 tokens it now splits K eight ways into the
+  zeroed logits (128 blocks). The atomic accumulation varies the summation order run to run, so
+  `SPARKINFER_DETERMINISTIC=1` keeps the single pass; `SPARKINFER_ROUTER_SPLITK=1` restores it too.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,536 / 13,700 / 19,228 / 24,581
+    -> 5,898 / 14,287 / 19,744 / 25,075 tok/s at 128 / 512 / 1K / 2K tokens.
+  - **Tested:** `qwen3_gguf_prefill_check` at 128 / 512 / 2,048 tokens: top-1 16/16, KL 0.0005 /
+    0.0075 / 0.00001.
+
+## [0.6.12] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill another +7% / +6%: the fused MoE GEMM prefetches its weights.**
+- **Now:** 5,518 / 13,607 tok/s at 128 / 512 tokens (0.6.10: 4,284 / 11,092; llama.cpp on the same
+  GGUF: 3,499 / 9,638). Bit-identical output.
+
+### Performance
+
+- **Qwen3.6 short-prompt prefill +7% / +6% more (128 / 512 tokens): the fused MoE GEMM prefetches
+  its weights.** The short-N fused quantized GEMM decoded a super-block, waited on it, multiplied,
+  and only then loaded the next, so each super-block paid a DRAM round trip with little else in
+  flight. Each thread now loads the next super-block's raw Q4_K / Q5_K bytes into registers right
+  after decoding the current one, and the load overlaps the tensor-core phase. The decode is the
+  same arithmetic on registers instead of memory: with `SPARKINFER_DETERMINISTIC=1` the prefill
+  check's KL is identical to the bit (0.01253) with the prefetch on or off.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 5,136 / 12,846 -> 5,518 / 13,607
+    tok/s at 128 / 512 tokens (llama.cpp 3,499 / 9,638). `SPARKINFER_QM_PREFETCH=0` turns it off.
+
+## [0.6.11] — 2026-10-03
+
+**Qwen3.6 short-prompt prefill +20% / +16% at 128 / 512 tokens.**
+- **Before:** with correct routing (0.6.10), half of a short Qwen3.6 prefill was the routed MoE
+  GEMMs at under half the GPU's bandwidth; 4,284 / 11,092 tok/s at 128 / 512 tokens.
+- **Now:** 5,136 / 12,921 tok/s (llama.cpp on the same GGUF: 3,499 / 9,638). Decode unchanged.
+
+### Performance
+
+- **Qwen3.6 short-prompt prefill +20% / +16% (128 / 512 tokens).** Three changes to the routed MoE
+  prefill:
+  - the short-N fused quantized GEMM runs 64-row blocks instead of 128 (half the shared memory,
+    so ~2.5x the resident blocks hide each other's weight loads; `SPARKINFER_QM_BM16_BN=128`
+    restores the old width);
+  - Q6_K experts take the fused GEMM too (UD files give 3 of 40 layers a Q6_K ffn_down_exps,
+    which materialized its whole int8 expert pool every prefill: 0.9 ms a layer;
+    `SPARKINFER_PFM_Q6K=0` restores that);
+  - the expert tile map is built by a parallel block scan instead of one thread (34 us a layer).
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 4,284 / 11,092 / 18,051 / 29,568
+    -> 5,136 / 12,921 / 19,381 / 30,315 tok/s at 128 / 512 / 1K / 4K tokens; llama.cpp on the same
+    file 3,499 / 9,638 at 128 / 512. Decode unchanged.
+  - **Tested:** `qwen3_gguf_prefill_check` at 128 / 512 / 2,048 tokens: top-1 16/16, KL 0.0013 /
+    0.013 / 0.00001 (the 512-token baseline varies 0.010-0.015 run to run); UD-Q4_K_XL / UD-IQ4_XS
+    15/16; server `mixed_conc_check` PASS, 0 problems.
+
+## [0.6.10] — 2026-10-03
+
+**Qwen3.6 answers with its real router: perplexity 15-18 -> 5.47, the same on every launch.**
+- **Before:** in most launches Qwen3.6-35B-A3B's layer-0 router loaded with a tail of zero rows (a
+  host-to-device copy raced the dequant that read it), so every token went to the same arbitrary
+  experts. Against llama.cpp on the same GGUF: top-1 0.58, KL 1.43. Present since at least 0.5.14.
+- **Now:** every upload completes before a stream reads it; top-1 0.92, KL 0.057, and the result is
+  identical launch to launch. Still +69-91% decode and +201-207% prefill at 4K-32K over llama.cpp.
+- **Also:** a decode step whose CUDA graph cannot be captured (out of memory) runs eagerly instead
+  of returning a stale token.
+
+### Fixes
+
+- **Qwen3.6-35B-A3B's MoE router loaded corrupted in most launches.** A synchronous `cudaMemcpy`
+  from pageable memory can return before its DMA lands, and the models' streams are non-blocking,
+  so the load-time dequant of the 2 MB F32 router read a run-dependent tail of zeros. Layer 0 then
+  routed every token to the experts those zeros made the top 8. This is the "Qwen3.6 is not
+  reproducible across launches" behaviour; present since at least 0.5.14. Every host-to-device
+  upload in the model code now waits for its copy.
+  - **Measured** (teacher-forced, 275-token prompt, RTX 5090): perplexity 15-18 (different every
+    launch) -> 5.47 (identical every launch); against `llama-server` on the same GGUF, top-1
+    0.58 -> 0.92, KL 1.43 -> 0.057. UD-Q4_K_XL and UD-IQ4_XS: top-1 0.92 / 0.94.
+  - **Speed:** decode unchanged; prefill at 512 tokens 12.1K -> 11.0K tok/s, because tokens now
+    spread over the experts the router really picks (the corrupt router sent them to the same
+    few). Against llama.cpp on the same file: decode 490 / 467 / 475 vs 284 / 276 / 248 tok/s at
+    128 / 4K / 32K, prefill 10.7K / 29.3K / 26.0K vs 9.6K / 9.5K / 8.6K at 512 / 4K / 32K.
+- **A decode step whose CUDA graph fails to capture runs eagerly** (#1269). Out of memory, the step
+  used to return the previous token with no KV or state update, and every later step decoded from
+  that stale state.
+
+## [0.6.9] — 2026-10-03
+
+**llama.cpp "UD" dynamic-quant GGUFs load: unsloth's Qwen3.8-27B GGUFs work again.**
+- **Before:** unsloth now publishes only UD quants of Qwen3.8-27B. They mix in Q3_K, IQ4_NL, IQ3_S
+  and IQ4_XS, which sparkinfer could neither size nor decode, so `Qwen3.8-27B-UD-Q4_K_M.gguf`
+  failed to load.
+- **Now:** it loads, and against llama.cpp on the same file and GPU: decode 94.7 vs 83.1 tok/s
+  (+14%), prefill 4,538 vs 2,809 at 128 tokens and 8,756 vs 3,839 at 4K. Concurrent requests
+  decode packed: 608 / 938 tok/s of decode at 16 / 32 rows against llama.cpp's 621 / 763.
+- **Also fixed:** dense k-quant GGUFs (Qwythos-9B) no longer mix prefill and decode; since 0.6.4
+  their mixed steps' decode rows were less faithful than one forward per row (0.90-0.93 vs
+  0.97-0.98 agreement).
+
+
+### Models
+
+- **GGUF types Q3_K, IQ4_NL, IQ3_S and IQ4_XS.** The reader knows their block sizes and the GPU
+  dequantizer decodes them (ported from ggml, MIT). No matmul kernel reads them, so the loader
+  refits each such tensor to Q4_K at load (Lloyd fit).
+  - **Tested:** `eval/gguf_dequant_check.py` (new; `runtime/examples/gguf_dequant_check`)
+    dequantizes a real tensor of every type in the file on the GPU and compares it with gguf-py:
+    all eight types bit-identical.
+- **Q5_K projections are refit to Q4_K at load** instead of being dequantized to bf16. UD files
+  store most GDN / attention matrices as Q5_K and no projection kernel reads it; read as bf16
+  (2 bytes/weight) they held Qwen3.8-27B-UD-Q4_K_M to 71.1 tok/s decode. `SPARKINFER_GGUF_Q5K_PROJ`
+  picks the format: `q4k` (default), `q8` (a Q8_0 refit) or `bf16` (the old behaviour).
+  - **Measured** (RTX 5090; accuracy vs `llama-server` on the same file, 275-token prompt and the
+    last 128 positions of an 8,448-token one):
+
+    | `SPARKINFER_GGUF_Q5K_PROJ` | decode | prefill @128 | top-1 / KL | perplexity |
+    |---|---:|---:|---|---:|
+    | `bf16` (before) | 71.1 | — | 0.949 / 0.0213 | 4.374 |
+    | `q8` | 78.8 | 1,888 | 0.956 / 0.0209 | 4.376 |
+    | `q4k` (default) | 83.4 | 3,885 | 0.956 / 0.0255 | 4.428 |
+
+    At 8K all three agree with llama.cpp on 94.5-96.1% of positions.
+  - **Unaffected:** Qwen3.6-35B-A3B-UD-Q4_K_M (its Q5_K tensors are experts) and Muse Glimmer
+    (its Q5_K head has its own path) load nothing differently.
+
+### Performance
+
+- **A dense FFN whose gate and up are different k-quants decodes through int8 mmvq.** UD files
+  give a layer's gate and up different types (Q4_K beside Q5_K, the odd Q6_K); every fast gate/up
+  kernel assumed Q4_K for both, so 19 of Qwen3.8-27B-UD-Q4_K_M's 64 layers fell back to an fp32
+  dequantizing kernel at 149 us per layer instead of 65. The new `gate_up_mmvq2_kq_kernel` takes
+  any Q4_K / Q5_K / Q6_K pair with the same int8 dot llama.cpp uses.
+  - **Measured:** decode 84.0 -> 95.2 tok/s at ctx 0; prefill at 128 tokens 3,885 -> 4,538.
+    `SPARKINFER_GU_KQ_MIXED=0` restores the fallback.
+  - **Accuracy** vs `llama-server`: top-1 0.956 (unchanged), KL 0.0255 -> 0.0253, perplexity
+    4.428 -> 4.419; over the 8K tail 0.938 / 0.196, within the three refit modes' spread.
+- **Concurrent requests on a UD GGUF decode packed.** Qwen3.8-27B-UD-Q4_K_M declined every packed
+  step, so each concurrent request ran its own forward: its Q8_0 `ssm_alpha` / `ssm_beta` had no
+  48-wide row kernel (they now load as bf16, as prefill already read them), and the Q6_K / Q8_0 row
+  GEMVs lacked its 5120 / 6144 widths. Packed, its mixed-type FFN then re-read the weights per row:
+  gate/up and Q5_K down gained row-batched kernels, and the tensor-core rows kernel reads Q5_K.
+  - **Measured** (`qwen3_gguf_cb_bench`): c16 283 -> 535, c32 327 -> 777 tok/s. Decode alone
+    (rows / step time) 608 / 938 tok/s against `llama-batched-bench` on the same file 621 / 763.
+  - **Tested:** `packed_decode_check` at 4-23 rows matches one forward per row; the server's
+    `mixed_conc_check` with packed decode on / off: 33 of 34 greedy answers identical.
+
+### Fixes
+
+- **Dense k-quant GGUFs no longer mix prefill and decode.** Their batched prefill runs int8
+  projections, and a mixed step's decode rows took their next token from it: Qwythos-9B Q4_K_M's
+  rows agreed with one forward per row 0.897-0.932 against a control's 0.966-0.979
+  (`packed_decode_check`, mixed mode), Qwen3.8-27B-UD-Q4_K_M's 0.926-0.949 against 0.947-0.975.
+  Such a model now prefills prompts in passes of their own, as before 0.6.4; `qwen3_gguf_cb_bench`
+  is no slower (Qwythos c16 / c32 1,531 / 2,288 -> 1,584 / 2,342 tok/s). NVFP4, MoE, Muse and
+  Bonsai models keep mixing. `SPARKINFER_MIXED_KQUANT=1` restores it.
+
+## [0.6.8] — 2026-10-03
+
+**Qwen3.6 mixes prefill and decode: first token at 16-32 concurrent requests ~40% sooner.**
+- **Before:** MoE models could not take mixed prefill + decode steps; a Qwen3.6 prompt waited for
+  its own pass beside the decoding requests (AIPerf chat TTFT p50 509 / 1,135 ms at c16 / c32).
+- **Now:** its decode rows ride the prompt chunks' pass (#1265): 312 / 709 ms. Against llama.cpp on
+  the same GGUF at 32 requests: 1,496 vs 413 tok/s, TTFT p50 709 vs 2,629 ms.
+- **Also:** the server takes `ignore_eos` for fixed-length benchmarks, and no model mixes while 8
+  or fewer requests are live.
+
+
+### Serving
+
+- **Mixed prefill + decode steps for MoE models (Qwen3.6-35B-A3B).** A mixed pass declined any
+  model without a dense FFN or a Q4_K head. The routed FFN is row-wise like the dense one, so the
+  decode rows now take the prompt's MoE path, and their head may also be Q6_K or Q8_0 (Qwen3.6's
+  GGUF head) at hidden size 2048 / 4096.
+  - **Measured** (AIPerf chat 1024/256 with `ignore_eos`, RTX 5090, mixing off -> on):
+    - c16: TTFT p50 / p90 509 / 974 -> 312 / 598 ms, 1,328 -> 1,282 tok/s, ITL p50 9.5 -> 11.2 ms;
+    - c32: TTFT p50 / p90 1,135 / 4,545 -> 709 / 3,863 ms, 1,465 -> 1,496 tok/s, request latency
+      p90 8.56 -> 7.84 s;
+    - `qwen3_gguf_cb_bench` c16 / c32: 1,671 / 1,775 -> 1,757 / 2,071 tok/s, max ITL 497 / 1,016
+      -> 73 / 75 ms.
+  - **Tested:** `packed_decode_check` gains a mixed mode (every step the decode rows plus the next
+    chunk of another prompt, teacher-forced): Qwen3.6 at 4 / 16 rows, decode-row argmax agreement
+    98.4-100% against a control's 98.4-100%, and the chunk-prefilled prompt agrees with a one-pass
+    prefill over its seed and 16 steps (0.94-1.0). `mixed_step_check` loads a GGUF too.
+- **Nothing is mixed while 8 or fewer requests are live, with or without a drafter.** A prompt's
+  own pass is the faster first token at that load: Qwen3.6 at c4 TTFT p50 80 -> 148 ms mixed.
+- **`ignore_eos`** (request field, as in vLLM and llama.cpp): generate `max_tokens` whatever the
+  model emits, for benchmarks that want a fixed output length. Such a request does not speculate;
+  combined with `response_format` it is refused (400), since a JSON answer ends with its grammar.
+
+## [0.6.7] — 2026-10-03
+
+**Qwen3.6 answers concurrent requests correctly, and 3.5-4x faster.**
+- **Before:** any 2+ concurrent Qwen3.6-35B-A3B requests decoded to repeated garbage tokens, since
+  at least 0.5.14. Past 8 they were correct but decoded one forward each: 457 / 461 tok/s at 16 / 32
+  requests, below one stream.
+- **Now:** correct output at every concurrency (#1262), and 1,621 / 1,834 tok/s at c16 / c32.
+- **Also:** Bonsai-2's mixed prefill + decode steps run its FP4 FFN (#1261).
+
+### Fixed
+
+- **Qwen3.6-35B-A3B answered 2+ concurrent requests with garbage, and decoded 9+ one at a time.**
+  Three faults in the packed decode step, the path every batch of concurrent requests takes.
+  None of them affects Qwen3.8, Bonsai-2 or Muse Glimmer.
+  - **The attention output gate was dropped.** `launch_flash_decode_split` applies an
+    `attn_gate` only in a gated combine that runs beside a Q8 output, which the packed step does
+    not pass. Handing it the gate also skipped the step's own sigmoid. Every packed step of a
+    model with hidden size 2048 or 4096 (Qwen3.6) ran its full-attention layers ungated. The
+    output was repeated tokens ("The capital petró fác dó fác fác ..."); this has been the case
+    since at least 0.5.14.
+  - **The shared expert returned without computing for more than 8 rows**
+    (`launch_shared_expert_q8_mmvq_rows`). It now goes 8 rows at a time.
+  - **bf16 row GEMVs refused more than 8 rows** (`launch_gemv_rows`, the MoE router among them).
+    That declined every packed step of 9+ rows, so 16 or 32 concurrent requests decoded one
+    forward each, below one stream's aggregate. They now go 8 rows at a time.
+  - **Measured** (RTX 5090, `qwen3_gguf_cb_bench` 256/256): Qwen3.6 c16 / c32 457 / 461 ->
+    1,621 / 1,834 tok/s, now with correct output; one stream is ~500 tok/s.
+  - **Tested:** the new `packed_decode_check` decodes the same prompts one forward per row
+    (reference), in packed steps, and one forward per row again (control), teacher-forced, and
+    compares argmax agreement. Qwen3.6 at 1 / 4 / 16 / 32 rows: packed 100 / 99.6 / 99.1 / 99.0%
+    against control 100 / 99.2 / 99.6 / 98.8% (before: 0%). Short prompts (24-128 tokens) and a
+    switch from packed to one-row steps mid-stream also pass.
+
+### Serving
+
+- **Bonsai-2's mixed steps run its FP4 FFN.** A mixed prefill + decode pass did not hand the
+  prefill its decode shadow's ternary legs, as a packed prompt prefill does, so every layer ran the
+  folded int8 FFN: a 1,024-row step took ~150 ms against ~86 now. Continuous-batching bench
+  (`qwen3_gguf_cb_bench`, 256/256, plus a 512-token prompt arriving mid-decode), Bonsai-2 c16 /
+  c32: 1,437 / 1,870 -> 1,550 / 2,074 tok/s. `eval/mixed_conc_check.py` on Bonsai-2: 34/34
+  greedy answers identical with mixing on and off.
+- **Mixing a burst is a choice now: `SPARKINFER_MIXED_ROW_TOKENS`** (off by default).
+  - **What it does:** set to N, fresh prompt tokens waiting beyond decode rows x N count as a
+    burst, a load ramping up or a wave arriving at once. A burst then takes passes of
+    `SPARKINFER_MIXED_BURST_CHUNK` tokens (default 4096) and up to 16 prompts, or with that at 0
+    the packed prefill.
+  - **The trade, measured** (RTX 5090, Qwen3.8-27B NVFP4; rule at N=256 vs off):
+    - the continuous-batching bench, where C streams arrive together, runs 3-9% more tok/s with
+      the rule (Bonsai-2 c32 2,074 -> 2,213-2,263; ModelOpt c32 1,749 -> 1,840-1,870);
+    - AIPerf chat is better without it. Mixing the first wave in budget-sized steps staggers when
+      its prompts finish, so the next waves do not arrive at once: TTFT p50 at c16 / c32
+      343-348 / 364-367 ms off, against 664 / 787-1,058 with the rule, and request latency p50 at
+      c32 6.0-6.1 s against 6.3-7.1.
+
+## [0.6.6] — 2026-10-02
+
+**Prompts longer than 16K tokens speculate.**
+- **Before:** the drafter's context was capped at 16,384 positions, so every longer prompt
+  silently decoded at plain speed (prose at 16K / 32K / 64K tokens: 96 / 93 / 86 tok/s).
+- **Now:** DFlash2 follows the whole `--ctx` (#1258): 184-200 / 173-188 / 132 tok/s, at the same
+  device memory.
+
+### Speculative decoding
+
+- **Prompts longer than 16K tokens speculate.**
+  - **Before:** the drafter's context was capped at 16,384 positions
+    (`SPARKINFER_DSPARK_MAX_CTX`), a limit from before #1243 gave DFlash2 window-sized slots.
+    Any longer prompt silently decoded at plain speed.
+  - **Now:** a drafter whose every layer attends a sliding window (DFlash2) follows the target's
+    whole `--ctx`, at no extra device memory (its slots hold ~4K rows either way). DSpark keeps
+    16,384.
+  - **Measured** (single request, greedy, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2, `--ctx 131072`;
+    `eval/spec_long_ctx.py`, tok/s, plain decode -> speculating):
+
+    | context | prose | code |
+    |---|---|---|
+    | 16K | 96 -> 200 | 97 -> 308 |
+    | 32K | 93 -> 173 | 93 -> 227 |
+    | 64K | 86 -> 132 | 87 -> 147 |
+
+  - **Tested:** `eval/spec_long_ctx_lossless.py`, prompts of 20K-47K tokens, greedy and
+    deterministic: 4/4 completions identical to plain decode.
+
+## [0.6.5] — 2026-10-02
+
+**8K-token prompts at 4-16 concurrent requests are now faster than vLLM.**
+- **Before:** the prefix cache kept about eleven 8K-token prompts on the device, so AIPerf's
+  re-sent long prompts hit it 1% of the time (vLLM 0.30: 35%), and output tok/s at c4 / c16 was
+  147 / 165 against vLLM's 147 / 171.
+- **Now:** prompts pushed off the device stay cached in host memory (#1254): 198 / 191 tok/s.
+
+### Serving
+
+- **The prefix cache keeps long prompts in host memory once they no longer fit on the device.**
+  - **Before:** the KV pool holds one `--ctx` worth of tokens (8,200 blocks on a 32 GB card at
+    `--ctx 131072`), so the cache's share kept about eleven 8K-token prompts. AIPerf re-sends
+    earlier cells' prompts, and its 8K-prompt cells hit the cache 1% of the time (vLLM 0.30, with
+    a larger pool: 35%).
+  - **Now:** an entry pushed off the device keeps its KV in pinned host memory
+    (`SPARKINFER_PREFIX_CACHE_HOST_KV_MB`, default a quarter of RAM up to 16 GB, about 60 8K-token
+    prompts; 0 turns it off). A hit on it copies the blocks back into the new request's session
+    (~270 MB for 8K tokens, a few milliseconds, where prefilling them again takes about half a
+    second). Each direction is one kernel over host-mapped memory, with no device staging.
+    New metrics: `sparkinfer_prefix_cache_host_hits_total`, `_demotions_total`, `_host_entries`,
+    `_host_kv_bytes`.
+  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2; host tier off -> on, one binary):
+    - long prompt 8192/128: c4 147 -> 198 tok/s, c16 165 -> 191 (vLLM 0.30: 147 / 171);
+      c16 TTFT p50 1,912 -> 1,612 ms;
+    - chat 1024/256, c32: 1,269 -> 1,370 tok/s; request latency p50 / p90 / p99 6.05 / 8.95 /
+      9.83 -> 5.92 / 7.18 / 7.52 s (vLLM: 7.80 / 10.28 / 11.31); TTFT p90 / p99 2,635 / 3,390 ->
+      1,718 / 2,337 ms. TTFT p50 rises 376 -> 729 ms: the first wave of 32 requests finishes
+      sooner and closer together, so the next wave arrives at once and queues behind itself;
+    - the other cells are within run-to-run variance.
+  - **Tested:** `eval/prefix_host_tier_check.py` runs interleaved multi-turn conversations with
+    the device share at 2% (every hit from the host tier) and at the default (every hit from the
+    device), deterministic: 18/18 answers identical. `spec_multiturn_check` passes with every
+    hit from the host tier.
+
+## [0.6.4] — 2026-10-02
+
+**Time to first token at 16-32 concurrent chats now matches vLLM.**
+- **Before:** p50 591 / 1,183 ms at 16 / 32 concurrent chats, against vLLM 0.30's 360 / 356.
+- **Now:** prefill and decode share one forward pass by default, and one pass carries several
+  waiting prompts (#1251): p50 355 / 372 ms, p90 and p99 below vLLM's, with output tok/s 14% /
+  23% above vLLM's.
+
+### Serving
+
+- **Mixed prefill + decode steps are on by default, and one step carries several prompts.**
+  - **Before:** a mixed step (`SPARKINFER_MIXED_CHUNK`, opt-in) carried part of one waiting
+    prompt; the others queued behind it, and every prompt still ended with a separate forward of
+    its own.
+  - **Now:** a step fills its budget (1024 prompt tokens by default) across up to 8 waiting
+    prompts (`SPARKINFER_MIXED_PROMPTS`), oldest first, and a prompt that ends in the step takes its
+    first token from the same pass, as a packed prefill does. `SPARKINFER_MIXED_CHUNK=0` turns
+    mixing off.
+    - A prompt with more than 2048 tokens left (`SPARKINFER_PREFILL_MIX_MAX`) keeps its own
+      prefill pass, which is faster for it (8K prompts chunked: -12% output tok/s at c16/c32).
+    - While no more requests are live than a speculation group takes (8), nothing is mixed: that
+      load is speculation's.
+    - A pass is always a multiple of 8 rows: an unaligned one runs every layer on the NVFP4
+      fallback (a 9-row step: 85 ms against 16-20 ms). The last few tokens before a prompt's end
+      or checkpoint take step_job's short-resume forward instead.
+    - A chunk that lands on a prefix-cache checkpoint snapshots it; the old single-chunk path
+      skipped that snapshot when a chunk ended exactly on the checkpoint.
+    - `SPARKINFER_MIXED_TRACE=1` logs every mixed step.
+  - **Measured** (AIPerf, RTX 5090, Qwen3.8-27B NVFP4 + DFlash2; off -> on, vLLM 0.30 beside):
+
+    | cell | TTFT p50 / p90 / p99 (ms) | output tok/s | vLLM TTFT p50 / p90 / p99, tok/s |
+    |---|---|---|---|
+    | chat 1024/256, c16 | 591 / 1,255 / 1,889 -> **355 / 1,240 / 1,845** | 861 -> 858 | 360 / 1,287 / 1,916, 753 |
+    | chat 1024/256, c32 | 1,183 / 2,712 / 3,372 -> **372 / 2,602 / 3,386** | 1,239 -> 1,266 | 356 / 2,811 / 3,815, 1,031 |
+    | long answer 128/1024, c16 | 180 -> 140 (p50) | 1,235 -> 1,235 | 373, 1,092 |
+
+    The other nine cells are within run-to-run variance. ITL p50 rises at chat c16/c32
+    (15.4 -> 17.8 and 18.9 -> 22.3 ms), still under vLLM's 19.8 / 29.2.
+  - **Open arrivals** (`eval/spec_open_arrivals.py`, 80 requests): mean latency 2.91 -> 2.82 s at
+    1 request/s and 4.67 -> 4.58 s at 2.
+  - **Tested:** `mixed_step_check` gains `multi` and `finish` modes (a fresh chunk, one resuming
+    mid-prompt, and one finishing its prompt, beside decode rows; chunks of 1 to 403 tokens);
+    `eval/mixed_conc_check.py` runs 24 concurrent chats and their follow-up turns with mixing on
+    and off (34/34 greedy answers identical, the same prefix-cache hits).
+
+## [0.6.3] — 2026-10-02
+
+**Speculation keeps working under a continuous load.**
+- **Before:** once a group ended, a new one formed only after every live request was a fresh
+  prompt, and one answer passing the drafter's 16K context ended speculation for its whole group.
+- **Now:** requests already decoding join a group without a draft (#1249), and a member that
+  reaches the drafter's context keeps going the same way (#1248).
+- **Measured:** under Poisson arrivals at 1 request/s (`eval/spec_open_arrivals.py`, RTX 5090,
+  Qwen3.8-27B + DFlash2), mean latency is 2.77 s against 4.29 s for the drafter without
+  adoption and 4.64 s without a drafter; p90 is 6.16 s against 8.55 / 8.71.
+
+### Speculative decoding
+
+- **A speculation group can form while other requests are already decoding** (#1249). A group needed every
+  live request to be a fresh prompt, so under a load that never drained (the next prompt arriving
+  while others decode) no group formed again once one ended. Now a group forms when at least one
+  fresh prompt is waiting.
+  - **Adoption:** requests already decoding are adopted as members without a draft. Their next
+    token is a one-row block, verified at the position and sampling step the ordinary decode step
+    would use.
+  - **Recurrent state:** each adopted session's GDN state goes back from packed decode's bf16 to
+    fp32, which is exact.
+  - **Leaving:** when no member drafts any more and nobody joins, the group hands them back to
+    packed decode.
+  - `SPARKINFER_SPEC_ADOPT=0` requires every request to be fresh, as before.
+
+- **A group member that reaches the end of the draft's context no longer ends speculation for
+  the group** (#1248). It stops drafting and verifies one row a step (lossless, as every verify is),
+  while the other members keep speculating and new requests keep joining. Before, the first
+  answer to pass 16K tokens, which a thinking model without `max_tokens` writes, handed every
+  member off. Speculation then stopped for the rest of a continuous load.
+- **A batched draft slides a member's slot itself** (#1247) instead of sending every member
+  through the per-slot draft for that step.
+- **The startup log names the loaded draft** (DFlash2 or DSpark) instead of calling every draft
+  DSpark (#1245).
+
+## [0.6.2] — 2026-10-02
+
+**The release container speculates by default** with z-lab's DFlash2 drafter:
+- **Faster at low and medium concurrency:** 1.2-2.2x the throughput of the same server without a
+  drafter at 1-4 concurrent requests (AIPerf), and the same at 16-32.
+- **Long answers:** for answers of thousands of tokens without `max_tokens`, 2.92x at 4
+  concurrent requests and 1.13x at 8.
+- **What made it possible:**
+  - DFlash2's draft slots slide over a 2,048-token window (~130 MB a slot, not ~0.5 GB);
+  - a request speculates up to the end of the drafter's context instead of only when its whole
+    `max_tokens` fits;
+  - the drafter steps off the device under load (0.6.1).
+- **Opting out:** `-e SPEC_DRAFT=none` serves without a drafter.
+
+### Speculative decoding
+
+- **DFlash2's draft slots hold a sliding window, not all the context a request can reach**: about
+  4K rows instead of up to 16,384, so ~130 MB a slot instead of ~0.5 GB. That includes slot 0,
+  which every loaded DFlash2 holds (its resident footprint 2.70 -> 2.35 GB).
+  - **Why it is safe:** every DFlash2 layer attends a 2,048-token sliding window, and positions only
+    grow, so no block reads a key older than `pos0 - 2047`.
+  - **How a slot slides:** when the next block would run past its rows, the keys still in the window
+    move to row 0 (one non-overlapping copy per layer, about every 2,048 positions) and the slot's
+    base position advances. Keys are stored rotated at their absolute positions, so moving them
+    changes nothing.
+  - **Long prompts:** a long prompt's first block keeps only the window's rows.
+  - DSpark, whose layers attend everything, keeps full slots. `SPARKINFER_DFLASH_SLOT_WINDOW` sets
+    the rows (0 keeps full slots).
+  - **Draft numerics:** unchanged wherever the attention launcher already trimmed to the window,
+    i.e. with default settings past ~2.2K keys, which is where a slot slides. Elsewhere only
+    acceptance could move, never output. With `SPARKINFER_DFLASH_IDLE_DRAFT` (whose cache can fall
+    behind the positions) a windowed slot declines the block instead of sliding.
+  - **Tested:** `dspark_tau_check`, this branch against main. tau, steps and LOSSLESS are identical
+    for 8K and 16K prompts (first block at the window) and for 1K + 4,096 and 1.6K + 3,000
+    generated tokens (slots slide mid-generation): 2.633/2.633, 3.000/3.000, 4.645/4.645,
+    3.674/3.674. `spec_group_check`, `spec_multiturn_check` and `offload_check` pass; conc_bench
+    c1-c8 is unchanged.
+- **The release container speculates by default.** `serve` downloads z-lab's
+  [`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter on first run
+  (3.8 GB, Apache-2.0) and loads it. With the draft offload (0.6.1) and the windowed draft slots
+  above, that is 1.2-2.2x the throughput at 1-4 concurrent requests and the same at 16-32
+  (AIPerf). For answers that run to thousands of tokens without `max_tokens`, it is 2.92x at 4
+  concurrent requests (859.7 vs 294.6 tok/s) and 1.13x at 8 (527.1 vs 466.7).
+  - `-e SPEC_DRAFT=none` serves without a drafter.
+  - `serve-dspark`, `SPARKINFER_DRAFT_MODEL` and `--draft-model` keep choosing their drafter.
+  - Past a 131,072-token context (`CTX` or `--ctx`) the default skips the drafter: a 32 GB card
+    has no room for it beside a pool that size.
+  - With `SPARKINFER_NO_DOWNLOAD=1` and no staged drafter, or when its download fails, it serves
+    without one instead of failing, so a deployment that cannot reach the Hub keeps starting.
+
+- **A request speculates up to the end of the draft's context, then decodes on.** Speculation
+  required prompt + `max_tokens` to fit the draft's 16,384 positions, so a request that left
+  `max_tokens` to the server's cap (16,384 in the release container; the OpenAI SDK's default)
+  never speculated. A group now speculates until a member reaches the end of the draft's context,
+  then every member decodes on as usual. The draft slot is sized to that reach rather than to
+  `max_tokens`, and the capture buffer to the prompt (verifies capture elsewhere): ~51 MB rather
+  than ~838 MB for a 1K prompt. `SPARKINFER_SPEC_GROUP=1` keeps the old bound.
+
+## [0.6.1] — 2026-10-02
+
+**Requests without `max_tokens` are no longer cut off at 256 tokens**: agents and OpenAI SDK
+clients, which omit it by default, get whole answers again.
+- A server with the DFlash2 drafter loaded is now as fast as one without at 16-32 concurrent
+  requests (it was 0.23-0.66x), and keeps 1.2-2.2x at 1-4 (AIPerf, RTX 5090). DSpark takes the
+  same offload path but was not measured.
+- Linux and Windows binaries are attached to the release again: the Windows build had failed
+  since 2026-08-14, so no tag since v0.5.6 produced them.
+- Speculation stays opt-in in the container (`serve-dspark` or `--draft-model`).
+- **Known:** a request speculates only when its prompt plus `max_tokens` fits the drafter's
+  16,384-position context, so one that leaves `max_tokens` to the cap does not speculate yet. The
+  fix (speculate up to the end of that context, then decode on) needs window-sized draft slots
+  first: sized to a long request's whole reach, a few of them fill the device and end
+  speculation for a concurrent load.
+
+### Fixed
+
+- **A request without `max_tokens` is no longer cut off at 256 tokens.** #1088's fix made such a
+  request generate until the model stops, up to `SPARKINFER_MAX_OUTPUT_TOKENS` (16,384 in the
+  release container), but the parsed request still defaulted `max_tokens` to 256, so the server
+  took every request as having set it. Agents and OpenAI SDK clients that omit it (the default)
+  had every answer stopped at 256 tokens with `finish_reason: "length"`. `chat_tools_test` now
+  checks that an omitted `max_tokens` reads as unset.
+
+### Build
+
+- **The Windows build compiles again** (#1238). MSVC rejected four constructs that gcc accepts:
+  - an `if constexpr` before a `#pragma unroll`;
+  - captureless lambdas reading a local `constexpr`;
+  - a GCC-only format attribute.
+
+  It also failed to link: the NVFP4-off fallbacks (Windows builds without CUTLASS) had drifted, with
+  two stale signatures and six missing. The tag's `release` job needs both platforms, so v0.5.13,
+  v0.5.14 and v0.6.0 have no binaries.
+
+### Speculative decoding
+
+- **A server with a draft loaded is as fast as one without at 16 and 32 concurrent requests, and
+  up to 2.2x faster at 1-4** (Qwen3.8-27B NVFP4 + DFlash2, AIPerf, RTX 5090). Before, a loaded
+  draft cost 0.23-0.66x at 16-32 requests, which is why it was not on by default.
+  - **Why it lost:** the KV pool is sized from `--ctx` alone, and the draft's ~3 GB came out of
+    the headroom concurrent serving needs for its prefill arenas and decode graphs. Prefills
+    found no arena and ran the token loop (~80 s for an 8K prompt) while every request waited.
+  - **The draft steps off the device while it cannot be used.** Its buffers live in a CUDA
+    virtual-memory arena (`VmmArena`). After live requests have stayed above the speculation
+    group size for `SPARKINFER_DRAFT_OFFLOAD_MS` (1 s), or at once when a prefill or a new session
+    runs out of memory beside it, everything goes to pinned host memory (~0.12 s). It comes back
+    at the same addresses, so every pointer it holds stays valid, when a group can form and the
+    device has room for it (`SPARKINFER_DRAFT_RESTORE_HEADROOM_MB`, 1 GB beyond the draft). One
+    round trip at load pins the host buffer and proves it works.
+  - **A join checks its room before it starts:** prefill arena, captured context, draft slot
+    and verify. Without room it prefills on the ordinary path instead of reaching the token loop
+    mid-join (`SPARKINFER_SPEC_JOIN_ROOM=0` skips the check).
+  - **A group ends at once when the requests waiting cannot all join.** Each join only asked
+    whether one more fitted, so 15 prompts arriving behind one member joined one at a time,
+    each with its own speculative prefill, until the group was full and ended anyway.
+  - **The draft quantizes at load,** so DFlash2's 2.7 GB bf16 MLP is never held until a first
+    speculative request. A 155 MB snapshot nothing reads is allocated only on first use.
+  - **Measured** (AIPerf, one server per run, output tok/s, draft loaded vs no draft):
+
+    | cell | c1 | c4 | c16 | c32 |
+    |---|---:|---:|---:|---:|
+    | chat 1024/256 | 208.1 / 94.7 | 513.2 / 308.6 | 841.2 / 858.8 | 1,246.1 / 1,069.7 |
+    | long answer 128/1024 | 216.5 / 99.8 | 725.1 / 352.1 | 1,234.6 / 1,239.3 | 1,997.7 / 2,001.9 |
+    | long prompt 8192/128 | 94.8 / 66.8 | 147.9 / 127.5 | 166.3 / 165.0 | 166.7 / 165.6 |
+
+    Speculation itself is unchanged: conc_bench c1/c2/c4/c8 at T=0.7 218/414/728/1,040 tok/s.
+  - **Tested:** `offload_check` (seeded requests before a 16-request burst and after the draft
+    comes back are identical to each other and to speculation off), `spec_group_check` and
+    `spec_multiturn_check` pass.
+
+## [0.6.0] — 2026-10-01
+
+**Concurrent requests speculate together.** Up to eight requests share one draft pass and one
+verify forward, so speculative decoding now pays at every load up to eight requests, not only for a
+request that is alone. Qwen3.8-27B NVFP4 with the DFlash2 draft, real prompts, RTX 5090, aggregate
+decode tok/s:
+
+| | 1 request | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| **0.6.0, T=0.7** | **212** | **410** | **714** | **1,040** |
+| **0.6.0, T=1.0** (the checkpoint's default) | **215** | **402** | **675** | **1,011** |
+| before concurrent speculation, T=0.7 | 177 | 178 | 319 | 633 |
+| vLLM 0.30 with the same draft, T=0.7 | 191 | 276 | 341 | 345 |
+
+A request speculating alone stays bit-identical to speculation off, greedy or seeded; a group uses
+batch arithmetic, as packed decode does.
+
+**Serving without a draft**, against vLLM 0.30.0 on the same card (AIPerf, Qwen3.8-27B NVFP4, one
+server per engine, the same cells and seeds):
+- chat (1024/256) and long answers (128/1024) at 1, 4, 16 and 32 concurrent requests: 1.04-1.21x
+  vLLM's throughput, with a lower inter-token latency in every cell;
+- 8K prompts (8192/128): 1.12x at one request, 0.87x / 0.97x / 0.99x at 4 / 16 / 32. AIPerf
+  re-sends earlier cells' prompts, and vLLM's larger KV pool keeps them in its prefix cache;
+  ours is sized from `--ctx`;
+- time to first token at 16 and 32 concurrent chats is still behind (p50 553 / 1,121 ms against
+  360 / 356). The opt-in mixed steps below measured 332 ms at 32 (against 1,240 ms off, on an
+  earlier main), at a throughput cost.
+
+**Against 0.5.14** (same box, engine benches; teacher-forced scores identical on Qwen3.8 NVFP4
+and GGUF, Muse Glimmer and Bonsai, while Qwen3.6's vary run to run on either build):
+Qwen3.8-27B NVFP4 decodes 5-8% faster at every context (97.2 -> 102.5 tok/s at empty context,
+86.9 -> 94.3 at 32K) and Ternary-Bonsai-2-27B 8-13%; continuous batching at 32 requests is +4% on
+Qwen3.8 and +23% on Bonsai. This release also carries the eight eval-bot speedups prepared as
+0.5.15, which was never tagged (see Kernels).
+
+### Speculative decoding
+
+- **8 concurrent requests speculate at over 1,000 tok/s at default sampling** (T=1.0, top_k 20,
+  top_p 0.95; c8 ~965 -> 1,013-1,017 tok/s, Qwen3.8-27B + DFlash2, real prompts).
+  - **A joining prompt's tail rides the group's verify:** when other members are speculating, a
+    joining prompt whose length is not a multiple of 8 prefills only its aligned body. Its last
+    1-7 tokens are rows of the group's next verify, committed whole; the last row's draw (at step
+    0, as prefill draws a seed) is the seed. This saves the separate forward the tail cost
+    (~12 ms), during which every member waited. Measured: c8 964/966 -> 999/988 tok/s.
+    A request that arrives alone keeps the whole prefill, so it stays identical to speculation
+    off. `SPARKINFER_SPEC_JOIN_TAIL=0` restores the whole prefill for every join.
+  - **Full-attention k/v take the block-scaled GEMM in wide passes** (`SPARKINFER_ATTN_GEMM`
+    default 3 -> 7). At 32 rows they ran as 8-row GEMV chunks, reading each weight four times.
+    Measured: c8 1001/1005 -> 1017/1013 tok/s; plain packed decode is unchanged.
+
+- **A request speculating alone verifies the depth that pays** (single-stream decode,
+  Qwen3.8-27B: 14.5K-token prose 96 -> 119 tok/s; spec_group_check DFlash2 T=0/0.7/1.0
+  226/198/192 -> 231/210/205, DSpark 178/155/151 -> 191/170/169; 4-turn ~7K-token chats with
+  DSpark +16-20%). The group path verified every proposal of every block. A lone member now
+  verifies the depth with the most tokens per ms: its acceptance record against the
+  single-sequence verify's measured cost curve (rows 1-4 nearly free, 5-8 ~0.75 ms each), scaled
+  by the run's own verify and draft times. Groups keep whole blocks, since rows are nearly free
+  there. Outputs stay identical to speculation off. `SPARKINFER_SPEC_ADAPTIVE_ROWS=0` verifies
+  every block whole.
+
+- **Speculating groups draft in one pass, and take up to 8 requests** (DFlash2): aggregate decode
+  on real prompts at T=0.7, c4/c6/c8: 485/~405/633 -> 573/669/733 tok/s on Qwen3.8-27B.
+  - **The draft:** a group's members drafted one after another, each streaming the draft's
+    weights for its own 8 rows. That was ~6 ms of a ~26 ms step at c4.
+    `DFlashDraftModel::forward_blocks` runs every member's block in one pass:
+    - every projection is one block-scaled NVFP4 GEMM over all members' rows (operands built
+      from the bf16 weights on first use, ~260 MB);
+    - the head is the target's NVFP4 LM head when it is resident;
+    - only the convs, RoPE, attention and selector run per member.
+
+    It costs 2.2 ms at four members. `SPARKINFER_DFLASH_BATCHED=0` drafts per member.
+  - **The MLP:** DFlash2's MLP is NVFP4 for every draft, in place of its Q4 copies, at the
+    same bytes. Single-stream spec_bench is unchanged: 226/220 against 220/230 tok/s.
+    `SPARKINFER_DFLASH2_MLP_FP4=0` restores the Q4 GEMVs.
+  - **Groups of up to 8:** `SPARKINFER_SPEC_GROUP` now defaults to 8. Past four members, each
+    verifies a shorter block, to fit the 32-row verify.
+  - **Tested:** lossless as before, with both drafts:
+    - single requests are identical to speculation off at T=0, 0.7 and 1.0;
+    - 4-turn cached conversations are identical too;
+    - the grouped verify check passes.
+
+    A 30K-token prompt prefills at the same speed after the batched operands are built, with
+    no fallback.
+
+- **A grouped verify runs its sequences' GDN work in one launch per layer** (c4/c8 652/864 ->
+  691/962 tok/s, Qwen3.8-27B + DFlash2, real prompts at T=0.7).
+  - **Before:** each speculating sequence's compact GDN conv and scan was its own launch, at every
+    one of the 48 GDN layers. A scan steps its few rows one by one, so it is latency-bound, and
+    at 8 sequences that was ~800 such launches a step.
+  - **Now:** `launch_dflash_gdn_{conv,scan}_compact_grouped` run every sequence in one launch each,
+    through the same per-sequence code. `grouped_verify_check` stays bit-identical.
+  - `SPARKINFER_GROUPED_GDN_ONE_LAUNCH=0` keeps the per-sequence launches.
+
+- **A batched draft walks every member's selector in one launch** (c8 ~960 -> 982-998 tok/s,
+  Qwen3.8-27B + DFlash2, real prompts at T=0.7). DFlash2's candidate selector ran one single-block
+  ~90 us launch per group member, eight in series at c8. `launch_selector_walks` runs them as one
+  grid, through the same per-walk code: pick for pick identical, greedy and coupled to a sampler.
+
+- **Concurrent requests speculate together** (`SPARKINFER_SPEC_GROUP`): aggregate
+  decode on real prompts with DFlash2 at T=0.7, c1/c2/c4: 177/178/319 -> 208/349/485 tok/s, on
+  Qwen3.8-27B (vLLM 0.30 with the same draft: 191/276/341); c6 and c8 unchanged.
+  - **Before:** speculation ran only for a request that was alone, and stopped as soon as a
+    second one arrived.
+  - **Now:** fresh prompts form a group (four at first, eight since the batched draft above).
+    Each drafts its own block from its own draft state (`DFlashDraftModel::use_slot`), and one
+    forward verifies every block
+    (`Qwen35Model::verify_grouped`): per-row attention tables as packed decode has, the compact GDN
+    scan and an accepted-prefix commit per sequence, and the block-scaled GEMMs a wide pass takes
+    (4 x 8 rows: 16.6 ms against 56 on the row kernels). A new prompt joins between steps. One
+    the group cannot take, or one past its size, hands every member to ordinary decode.
+  - **Single requests:** they now take the group path too: spec_bench T=0/0.7, DFlash2
+    207/193 -> 227/227 tok/s, DSpark 174/170 -> 187/175. The verify uses the KV split count
+    ordinary decode uses at each position, and a block stops at the next split tier.
+  - **Tested:** `grouped_verify_check` (two sessions verified together match each verified
+    alone, bit for bit, with `SPARKINFER_GROUPED_WIDE=0`); every single-request completion is
+    identical to the same launch with speculation off, at T=0, 0.7 and 1.0 and over 4-turn
+    ~7K-token cached conversations, with both drafts.
+
+- **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
+  - **Before:** only greedy requests speculated, and a request that sets no temperature takes
+    generation_config's T=1.0, so almost no chat traffic did.
+  - **Now:** the first token and every verified position are drawn with the request's own
+    sampler at that token's step -- top_k/top_p mask, temperature, Gumbel noise from Philox(seed,
+    vocab id, step), argmax -- and a proposal is kept while it equals that draw. A seeded request
+    gives the same tokens speculated or not, so this is lossless in the same sense greedy
+    speculation is. The draft proposes with the same sampler over its own logits (coupled), so its
+    proposals land on the target's draws more often. Penalties, logit bias and logprobs still
+    decode per token. `SPARKINFER_SPEC_SAMPLED=0` keeps speculation greedy-only;
+    `SPARKINFER_DFLASH_COUPLED=0` makes the draft propose argmaxes.
+  - **Measured** through `sparkinfer_server` (`eval/spec_sampled_check.py`: ModelOpt NVFP4 with
+    the DSpark draft, 6 prompts x 256 tokens, one request at a time, `SPARKINFER_DETERMINISTIC=1`),
+    against the same launch decoding sampled requests token by token: T=0.7 97.9 -> 152.9 tok/s,
+    T=1.0 98.8 -> 153.7 tok/s, every completion identical at T=0, 0.7 and 1.0. Greedy speculation
+    is unchanged (dspark_tau_check at 16K: tau 1.4713 and LOSSLESS on both).
+
+- **A multi-turn chat speculates on every turn and reuses its cached prefix** (time to first
+  token 487 -> 120 ms on ~7K-token conversations, Qwen3.8-27B with DSpark).
+  - **Before:** a speculated prompt took no prefix-cache checkpoints, so the next turn of the
+    same conversation missed the cache and re-prefilled everything; and a prompt that did hit the
+    cache was not speculated at all.
+  - **Now:** a cache hit speculates. Prefill resumes past the cached prefix with hidden-state
+    capture, and the draft drafts from the rows it has (its attention starts at the first
+    captured position). The speculative prefill takes the prompt's checkpoints exactly as the
+    ordinary prefill does -- one pass that snapshots at each, or a pass per segment where that
+    declines -- and the prefill's token is sent before the verify graphs are recorded.
+    `SPARKINFER_SPEC_PREFIX_HIT=0` restores the old behaviour.
+  - **Measured** (`eval/spec_multiturn_check.py`: 3 conversations x 4 turns, T=0 and 0.7, one
+    request at a time, ModelOpt NVFP4 + DSpark): ~7K-token prompts, TTFT p50 483-491 -> 120-148
+    ms, decode 134-140 -> 127-131 tok/s on a hit (the draft sees only the uncached part); ~1.6K
+    prompts, TTFT unchanged. Every completion identical to the same launch with speculation off.
+
+- **DFlash2 drafter** (z-lab `Qwen3.8-27B-DFlash2`), opt-in beside DSpark: sampled requests
+  1.78x plain decode against DSpark's 1.57x on Qwen3.8-27B.
+  - **What it runs:** the checkpoint is recognised by its architecture. Each attention and MLP
+    sublayer is wrapped in a grouped dynamic causal conv (2 taps, a per-16-channel kernel
+    correction projected from the block rows), attention is bidirectional within the 2048-token
+    window, and the proposals come from rows 1..7 through a candidate selector: each slot's
+    top-16 logits (`launch_topk_rows`), then one walk from the anchor scoring every candidate as
+    its logit plus a rank-256 predecessor/successor product (`launch_selector_walk`). Sampled
+    requests draw the walk with the target's Gumbel key, so the draft stays coupled.
+  - **Memory:** the draft's bf16 MLP weights are released once their quantized copies exist
+    (2.7 GB), and the successor codebook keeps only the draft vocabulary's rows. Without that a
+    32K prompt left the target's batched prefill no room, and its fallback prefill is not
+    bit-identical to plain decode's.
+  - **Measured** (RTX 5090, ModelOpt NVFP4, `dspark_tau_check`, 128 greedy tokens), DSpark ->
+    DFlash2: 1K prose 130.3 -> 133.2 tok/s, 8K 183.1 -> 181.7, 16K 216.3 -> 210.4, 32K 127.5 ->
+    128.9, every run LOSSLESS. Through the server (`spec_sampled_check.py`): T=0.7 154.2 -> 175.9,
+    T=1.0 154.8 -> 177.0 tok/s, every completion identical at T=0, 0.7 and 1.0.
+  - **Tested:** against z-lab's reference model on the same inputs (bf16 draft): final hidden rows
+    cos >= 0.9998, selector paths identical, at 1K and 8K. `sample_rows_topk_gpu_test` checks
+    `launch_topk_rows` against a sorted top-k.
+
+### Serving
+
+- **The prefix cache is sized by memory, not by a count** (AIPerf chat 1024/256 at 32 concurrent:
+  971 -> 1,070 tok/s, TTFT p50 1,575 -> 1,121 ms; at 16: TTFT p50 792 -> 553 ms; Qwen3.8-27B NVFP4).
+  - **Limits:** at most 32 entries in half the KV pool held about 32 chat prompts. The defaults
+    are now 256 entries, recurrent-state snapshots up to a quarter of RAM (8-32 GB,
+    `SPARKINFER_PREFIX_CACHE_HOST_MB`), and up to three quarters of the KV pool
+    (`SPARKINFER_PREFIX_CACHE_KV_PCT`). Least-recently-used entries are evicted when a request
+    needs the room, as before.
+  - **Capacity:** `/v1/capacity` and `sparkinfer_free_kv_blocks` count blocks only the cache holds
+    as free, since admission evicts them on demand. A full cache no longer reads as a full server.
+  - **Speculation:** a speculative join evicts a few blocks before growing its session, so a full
+    cache cannot stop it speculating.
+
+- **Tokens are streamed off the engine thread** (long answers c32 1,600 -> 1,986 tok/s, ITL p50
+  19.7 -> 15.9 ms on Qwen3.8-27B).
+  - **Before:** every emitted token ran the caller's callback on the worker thread, one row after
+    another -- for a streamed chat, incremental detokenization, the stop-sequence filter, the
+    SSE JSON and a socket write -- while the device idled: p50 4.0 ms of a 19 ms step at 32 rows.
+  - **Now:** the worker only queues each token. The request's own thread, which was already
+    blocked waiting for its result, runs the callbacks as tokens arrive, all requests in
+    parallel. A callback that returns false (a stop sequence, a closed connection) is seen by
+    the worker at that request's next token, and the result is cut back to the tokens the
+    callback took, so output and usage are unchanged. `SPARKINFER_ASYNC_EMIT=0` restores
+    emission on the worker.
+  - **Measured** (AIPerf, RTX 5090, ModelOpt NVFP4, one binary): longanswer 128/1024 c32 1,599.5
+    -> 1,986.0 tok/s (vLLM 0.30: 1,785); chat 1024/256 c32 1,176 tok/s. Six streamed and
+    non-streamed requests (stop sequences, logprobs, the completions endpoint) give identical
+    text, finish reasons and token counts either way.
+
+- **A long prompt's prefill scratch is given back** (chat c32 after an 8K-prompt cell 1,073 ->
+  1,183 tok/s on Qwen3.8-27B, the same as on a fresh server).
+  - **Before:** the batched prefill keeps its scratch arenas across calls and only ever grows
+    them, releasing them only past 1 GB. An 8K pass (~0.9 GB) stayed resident for every later
+    chat-sized pass, as did the GDN scan workspace it grew. A c32 server has ~1 GB free beside
+    its KV pool and 32 sessions' recurrent state, and that headroom is what the packed prefill
+    needs: its passes ran 278 ms instead of 207.
+  - **Now:** a pass gives the arenas back -- and the GDN scan workspaces and the attention V plane
+    -- when they hold more than twice the largest use of the last 8 passes. A one-off long prompt
+    ages out after a few ordinary passes, and a mix of sizes does not churn.
+    `SPARKINFER_PREFILL_ARENA_SHRINK=0` keeps them.
+  - **Measured** (AIPerf, RTX 5090, one server per run): chat 1024/256 c32 on a fresh server
+    1,175.8 tok/s; after an 8192/128 c16 cell 1,183.0 (shrink off: 1,072.9); the 8K cell itself
+    unchanged at 168.3.
+
+- **Chat prompts that arrive together are prefilled together** (chat c16 TTFT p50 2.04 -> 1.08 s,
+  696 -> 765 tok/s on Qwen3.8-27B).
+  - **Before:** packed prompt prefill refused any prompt with a prefix-cache checkpoint, and a
+    chat request past the checkpoint minimum always has one. So a wave of chat prompts -- up to
+    11 at once at c16 -- went through one pass each, ~131 ms apiece, while every decoding
+    request waited.
+  - **Now:** a pack takes prompts with one checkpoint each. Such a prompt's Gated-DeltaNet conv
+    and scan run in two parts, and the state goes to its snapshot between them, exactly as the
+    one-prompt pass does it. A pack whose length is not a multiple of 8 would lose the NVFP4
+    GEMMs for every layer, so one prompt's last 1-7 tokens run as decode steps after the pass.
+    `SPARKINFER_PACK_CHECKPOINTS=0` keeps checkpointed prompts on the one-prompt path.
+  - **Tested:** `pack_ckpt_check` prefills three chat-length prompts alone and packed: under
+    `SPARKINFER_DETERMINISTIC=1` the seeds and the snapshots are bit-identical, the trimmed
+    prompt included.
+
+- **A chat request no longer pins 205 MB on its prefill's critical path** (1.19x chat
+  throughput at 16 concurrent requests; a lone 1K-token chat prompt's time to first token
+  208 -> 137 ms, on Qwen3.8-27B).
+  - **Before:** a prompt past the prefix-cache checkpoint minimum snapshots its recurrent state
+    (~205 MB) into pinned memory. Pinned buffers came back only when the cache evicted an entry,
+    and it keeps up to 32, so until then every chat request pinned a fresh buffer: 72-83 ms of a
+    204 ms prefill on an RTX 5090 box. Pinning ahead on another thread does not hide it -- the
+    driver stalls the other thread's CUDA calls for the duration.
+  - **Now:** a snapshot is filled in a pinned buffer from a small free list, then a background
+    thread moves it to reused pageable memory (a plain memcpy) and hands the pinned buffer back.
+    After the first snapshot of a process nothing pins on the request path. A cache hit restores
+    from pageable memory (~19 ms instead of ~8 ms). `SPARKINFER_SNAPSHOT_MIGRATE=0` keeps
+    snapshots pinned.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c16 583 -> 696 tok/s, TTFT
+    p50 2.78 -> 2.04 s; one request at a time, prefill p50 204 -> 134 ms.
+    `prefix_resume_check` under `SPARKINFER_DETERMINISTIC=1`: a hit still reproduces the uncached
+    split exactly.
+
+- **A chat prompt's last few tokens after its prefix-cache checkpoint take one forward** (chat c32
+  TTFT p50 1,527 -> 875 ms, 1,082 -> 1,111 tok/s on Qwen3.8-27B).
+  - **Before:** a chat prompt's final checkpoint sits at the start of its assistant turn, 1-7
+    tokens before the end -- under the in-pass split's 16-token segment minimum -- so its
+    prefill ran a pass per segment, and those last tokens got a whole prefill pass of their own:
+    169 ms per 1K-token chat prompt under load instead of ~96.
+  - **Now:** a resumed range of 8 tokens or fewer goes through the verify path's single forward
+    (`ingest_tail_rows`), as the tail of an aligned pass does.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c32 per-prompt prefill p50
+    169 -> 99 ms; c1 unchanged (TTFT 103 ms). `prefix_resume_check`: a hit still reproduces the
+    uncached split exactly.
+
+- **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
+  chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
+  - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
+    pass and the 1-7 tokens left over ran as decode steps (#1207), each a full weight read: ~40
+    ms for a 4-token tail. A small prefill pass for the tail was slower still, because it
+    displaced the cached whole-prefill graph.
+  - **Now:** the tail runs through the verify path -- the path greedy speculation relies on to
+    reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
+    packed decode's graphs are never evicted, committing every row
+    (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
+    bias, keeps the decode steps. It has its own 149 MB arena, so it never re-allocates the
+    buffers the packed decode's graphs point at. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
+  - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
+    (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
+    snapshots either way.
+
+- **A short prompt prefills ~3x faster when its length is not a multiple of 8** (time to first
+  token at 9-100 prompt tokens, 81-88 -> 25-31 ms, Qwen3.8-27B NVFP4). The aligned-body split
+  (`SPARKINFER_PREFILL_ALIGN8_MIN`) applied only from a 128-token body, a threshold set while the
+  1-7 leftover tokens ran as decode steps; they now take one verify forward, so the split pays
+  from an 8-token body and the default is 8. A prompt under 128 tokens no longer runs every layer
+  on the unaligned fallback.
+
+- **Packed decode samples its rows in one launch** (1.13x sampled cb-decode @c32 on Qwen3.8-27B).
+  - **Before:** each sampled row ran forward_token's sampler on its own: a full-vocabulary radix
+    sort for top_k/top_p, Gumbel noise over all 248K entries, then argmax, row after row. At 32
+    rows with the checkpoint's default sampling (T=1.0, top_k 20, top_p 0.95) that was about 3 ms
+    of an 18.7 ms step on an RTX 5090, 18% slower than greedy.
+  - **Now:** `launch_sample_rows_topk` takes every row whose top_k is 1–128 in one launch. The
+    top_k survivors are found without sorting the vocab, and only they draw noise, with the same
+    Philox key (seed, vocab id, step) and arithmetic, so each row draws the token the per-row path
+    draws. 32 rows: 2,546 us -> 35 us. Rows without a top_k in range keep the per-row path.
+    `SPARKINFER_BATCHED_SAMPLER=0` samples every row alone.
+  - **Measured** (`qwen3_gguf_cb_bench`, 256-token prompts and answers, default sampling, ModelOpt
+    NVFP4): mean ITL at 16 / 32 rows 14.1-14.3 -> 12.8-12.9 ms and 18.0-18.2 -> 15.9 ms, the same
+    as greedy; aggregate at 32 rows 1,568-1,607 -> 1,792-1,803 tok/s.
+  - **Tested:** `sample_rows_topk_gpu_test` compares 896 rows against the per-row path (ties at the
+    top_k boundary, signed zeros, -inf entries, heavily duplicated logits): 0 mismatches.
+
+- **Mixed prefill + decode steps, opt-in** (`SPARKINFER_MIXED_CHUNK=<tokens>`): a latency mode.
+  At 32 concurrent chats, TTFT p50 1,240 -> 332 ms for 1,113 -> 948 tok/s, on Qwen3.8-27B.
+  - **What it does:** while requests decode and a prompt waits, the decode step carries the next
+    chunk of that prompt in the same forward (`Qwen35Model::mixed_step`). The norms, projections,
+    FFN and LM head run once over rows + chunk; the decode rows take packed decode's own GDN
+    step, per-row KV append and split-KV attention, and the chunk the prefill's. A prompt is
+    split into equal chunks of at most the budget, a prefix-cache checkpoint is reached with one
+    verify forward and snapshotted as the ordinary prefill does, and the last <= 32 tokens take
+    that forward too (`ingest_tail_rows` now takes up to 32 rows).
+  - **The trade, measured** (AIPerf, RTX 5090, ModelOpt NVFP4, budget 2048), off -> on:
+    - chat 1024/256 c32: 1,113 -> 948 tok/s, TTFT p50 1,240 -> 332 ms, ITL p50 21.4 -> 31.3 ms;
+    - chat c16: TTFT p50 299 ms at 714 tok/s;
+    - 8K prompts c4: 128 -> 118 tok/s, TTFT p50 1,528 -> 1,078 ms.
+
+    Decode no longer stalls behind a prompt's whole prefill, and arrivals stop coming in
+    synchronized waves. But one prompt per mixed pass does not amortize its weight reads the
+    way a packed prefill of many prompts does, so it is off by default.
+  - **Tested:** `mixed_step_check` (two decoding sessions plus a chunk, against `decode_packed` and
+    a separate prefill): the decode rows agree for every token at 254-, 1022- and 2046-token
+    chunks, and the chunk's continuation diverges only at late near-ties.
+
+### Kernels
+
+Merged by the eval bots. Each gain is on the RTX 5090 eval box against the same-box `main` of its round.
+
+- **Ternary-Bonsai-2-27B**:
+  - **single-row decode** overlaps its launch chain (#1210; 1.09x decode @128, 1.07x @32k). Outputs are bit-identical to main:
+    - the FFN GEMVs load their weights before their input is ready;
+    - k/v run beside q on the side stream;
+    - the layer tail writes the next layer's rotated input, so the next layer skips its own rotation;
+    - the GDN conv sums the qkv split partials itself, and conv and scan launch programmatic;
+    - the hd256 int8-KV attention input takes one fused launch.
+
+    `SPARKINFER_PTQ1_DP4A_PDL`, `SPARKINFER_PTQ1_RQ_PDL`, `SPARKINFER_BONSAI_KV_SIDE`, `SPARKINFER_BONSAI_TAIL_ROTQ`, `SPARKINFER_BONSAI_GDN_PDL`, `SPARKINFER_BONSAI_QKV_PART`, `SPARKINFER_BONSAI_QK_FUSE` and `SPARKINFER_PTQ1_ROW1_TILES` `=0` restore main's launches one by one.
+  - **long prefill**: the attention and GDN projections read the decode shadow's ternary blocks as NVFP4 and run on the FP4 tensor cores, like the long-prefill FFN (#1188; 1.20x prefill @4k). `SPARKINFER_PREFILL_TERNARY_NVFP4_PROJ=0` keeps the int8 projections.
+  - **continuous batch** (#1197; 1.13x cb-decode @c32):
+    - a prompt pack reads the decode shadow's legs, as a lone prompt does (`SPARKINFER_BONSAI_PACK_SHADOW=0` restores the folded legs);
+    - a pack's GDN segments scan on three streams, which applies to every model's packed prompts (`SPARKINFER_PACK_GDN_STREAMS=1` restores one stream);
+    - packed rows take their B fragments by `ldmatrix`, and the tile's last CTA sums a split's partials instead of a second launch (`SPARKINFER_ROWS_SPLIT_FUSED=0`);
+    - rotations launch programmatic (`SPARKINFER_ROTQ_PDL=0`).
+- **Qwen3.8-27B**: past the fused GEMM's row limit, the long prompt runs the eight FP8-stored FFN layers (56–63) on the NVFP4 tensor cores. Their Q4_K decode legs are converted to NVFP4 once per layer pass, into the int8 weight cache's buffers (#1213; 1.06x prefill @16k). `SPARKINFER_Q38_FFN8_NVFP4=0` keeps the int8 legs.
+- **Qwen3.8-27B**: long-prompt prefill moves fewer bytes per MAC, bit-identical to main (#1211; 1.07x prefill @16k):
+  - the GDN projections' fp8 GEMM runs on 64x64 warp tiles, 451–455 → 527–536 TOPS (`SPARKINFER_FP8_GEMM_W64=0`);
+  - the GDN out_proj adds the residual in its epilogue (`SPARKINFER_Q38_FP8_RESID=0`);
+  - the gated norm and the GDN input norm write e4m3 for their GEMMs themselves (`SPARKINFER_Q38_GATED_NORM_FP8=0`, `SPARKINFER_Q38_XN_FP8=0`);
+  - the attention gate folds into the o-proj row-quantize (`SPARKINFER_Q38_GATE_QUANT=0`);
+  - the 8-bit FFN layers (56–63) keep their int8 weights across 4096-token chunks (`SPARKINFER_PREFILL_FFN_WCACHE_FP4=0`);
+  - ssm_alpha and ssm_beta run in one pass (`SPARKINFER_PREFILL_SKINNY_PAIR=0`).
+- **Qwen3.8-27B**: single-row NVFP4 decode overlaps its launch chain, bit-identical to main (#1196; ModelOpt 1.04x decode @256k, 1.02x @128):
+  - the dp4a GEMVs launch programmatic and stream their first weights while their producer runs (`SPARKINFER_DECODE_PDL=0`);
+  - the post-attention and closing norms write the NVFP4 dp4a input themselves, so the standalone quantizes are gone (`SPARKINFER_DECODE_NORM_NV=0`);
+  - FFN down runs two rows per warp-group (`SPARKINFER_DECODE_DOWN_NR2=0`);
+  - 6:1 decode attention loads V ahead for splits of 256 tokens or more (`SPARKINFER_FA6_VPRE_MINCHUNK=0`).
+- **Qwen3.8-27B and Ternary-Bonsai-2-27B**: the hd256 6:1 int8-KV split decode attention reads K and V with wide loads and runs QK and PV on `mma.sync`. The partials are bit-identical (#1198; Qwen3.8 ModelOpt 1.07x decode @256k, Bonsai 1.06x decode @32k). `SPARKINFER_FA6_WIDE=0` keeps the wmma form.
+- **Muse Glimmer**: the 128-token prefill keeps `ffn_down` and `o` on the narrow NVFP4 tile, with the stream cache paying their conversion once (#1209; 1.18x prefill @128). `SPARKINFER_MUSE_NVFP4_{DOWN,WO}_MINN=512` restores the int8 legs.
+
+### Fixed
+
+- **Muse Glimmer at 32 concurrent requests no longer falls to under a fifth of its speed in some runs**
+  (#1236; `qwen3_gguf_cb_bench` c32: 2,140 or ~380 tok/s from run to run -> 2,117-2,126 every
+  run). v0.5.14 does the same.
+  - **Cause:** the partial ffn_down fill left a flat 1 GB for the runtime's own allocations after
+    load. At 33 sessions those need about that much, and peak use varied by 16 MB between runs.
+    When it fell short, the verify scratch and every decode graph capture failed with out of
+    memory, and the whole run decoded uncaptured (mean ITL 13 -> 82 ms).
+  - **Fix:** the room left grows by 16 MB per session past 17, so 33 sessions keep 1.25 GB
+    (12/52 down layers instead of 15). 16 concurrent requests and fewer are unchanged.
+    `SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB` still overrides.
+
+- **A wide packed-decode graph no longer outlives the NVFP4 LM head it reads.** A prefill of 1,024+
+  tokens gives the head back (`release_lm_head_fp4`) to fit its scratch arena, but the verify
+  graph cache was not keyed on it, so a graph recorded at 16+ rows while the head was resident
+  kept replaying against the freed buffer -- correct only while nothing reused that memory.
+  The cache now drops its graphs when the head changes. A prefill or a session whose allocation
+  fails beside the head also gives it back and retries.
+
+- **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
+  `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
+  non-recording pass left the stream capturing and every later call on it failed ("operation not
+  permitted when stream is capturing"). DSpark never reached it because it warms every width
+  first; the eager tail above is the first caller that does not record.
+
+- **A speculated prompt prefilled on the slow path, and not with ordinary decode's arithmetic.**
+  Hidden-state capture kept a prompt off the 8-aligned body + tail split, so a prompt of 128+
+  tokens whose length is not a multiple of 8 ran every layer on the unaligned NVFP4 fallback
+  (TTFT 282 vs 83 ms at ~1.4K tokens), and a prompt with a checkpoint segment under 16 tokens
+  skipped the per-segment split the ordinary prefill takes. Either made greedy and seeded
+  speculative output differ from ordinary decode after a few hundred tokens. Capture now takes
+  both, a pass that starts past zero records its rows at their positions, and the tail's verify
+  forward writes its rows straight into the draft's context.
+
+- `SPARKINFER_SPECULATIVE=0` keeps the draft loaded but decodes every request token by token (the
+  A/B reference), and `SPARKINFER_PREFIX_CACHE=1` keeps the prefix cache on under
+  `SPARKINFER_DETERMINISTIC=1`.
+
 ## [0.5.14] — 2026-09-29
 
 **Prefill no longer falls off the fast path on seven prompt lengths in eight.**

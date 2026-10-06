@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     // requant defaults); those paths diverge from the reference and falsely fail the correctness
     // gate (~79-83% top1). overwrite=1 so evaluate_bidir's export cannot leak into scoring.
     setenv("SPARKINFER_DOWN_REQUANT_Q4K", "0", 1);
+    setenv("SPARKINFER_MOE_DOWN_REQUANT_Q4K", "0", 1);   // the routed expert downs too
 
     const std::string path = argv[1];
     const int topk = atoi(argv[2]);
@@ -52,7 +53,10 @@ int main(int argc, char** argv) {
         printf("[FAIL] legacy weight dirs are not scoreable (no config.txt reader here)\n");
         return 1;
     }
-    cfg.max_seq    = 2048;
+    // The KV is allocated for max_seq tokens and every position is fed through it, so it has to
+    // cover the whole sequence: a fixed 2048 let a longer one write past its blocks, which read as
+    // the model collapsing past 2K (Muse Glimmer: perplexity 15 -> 1,000+ beyond position 2048).
+    cfg.max_seq    = std::max(2048, argc - 3 + 16);
     if (const char* e = getenv("SPARKINFER_SCORE_MAX_SEQ")) {
         int v = atoi(e);
         if (v > cfg.max_seq) cfg.max_seq = v;

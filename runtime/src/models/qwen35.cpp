@@ -19,10 +19,13 @@
 // respect those forks, and anything captured into the decode graph has to capture them too.
 
 #include "sparkinfer/models/qwen35.h"
+#include "sparkinfer/cuda_h2d.h"
 #include "sparkinfer/device_health.h"
 #include <atomic>
 
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <thread>
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
@@ -138,8 +141,8 @@ constexpr int kDFlashDeferred = INT_MIN;
 // bound for scratch-buffer sizing, NOT an OpenAI-documented limit.
 constexpr int kMaxLogitBiasEntries = 1024;
 
-// launch_gguf_dequant only implements F32/F16/Q8_0/Q4_K/Q6_K. Reject anything
-// else at load time so Q5_K (etc.) cannot silently fall through as F32.
+// The types launch_gguf_dequant implements. Reject anything else at load time so an
+// unknown type cannot silently fall through as F32.
 bool ggml_dequant_supported(int ggml_type) {
     switch (ggml_type) {
         case 0:  // F32
@@ -149,10 +152,22 @@ bool ggml_dequant_supported(int ggml_type) {
         case 13: // Q5_K (UD / dynamic quants mix this in)
         case 14: // Q6_K
         case 30: // BF16 (Ternary-Bonsai-2 keeps its GDN alpha/beta projections here)
+        // The low-bit types llama.cpp's "UD" dynamic quants mix in. No matmul reads them:
+        // dev_quant() refits them to Q4_K at load (ggml_requant_to_q4k).
+        case 11: // Q3_K
+        case 20: // IQ4_NL
+        case 21: // IQ3_S
+        case 23: // IQ4_XS
             return true;
         default:
             return false;
     }
+}
+
+// Types that are only dequantized, never read by a matmul: dev_quant() turns them into Q4_K
+// (dequant to bf16, then the Lloyd-max Q4_K fit), so every projection kernel sees a type it has.
+bool ggml_requant_to_q4k(int ggml_type) {
+    return ggml_type == 11 || ggml_type == 20 || ggml_type == 21 || ggml_type == 23;
 }
 
 // PTQ1_0 (Ternary-Bonsai-2's 1.75-bit weights) has no kernel of its own yet, so it enters the
@@ -298,7 +313,7 @@ void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long
     }
     void* dev = nullptr;
     if (cudaMalloc(&dev, host.size() * 2) != cudaSuccess) return nullptr;
-    if (cudaMemcpy(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(dev);
         return nullptr;
     }
@@ -378,7 +393,7 @@ void* unrotate_ternary_to_bf16(const UnrotateJob& j, const std::string& name) {
     for (long r0 = 0; r0 < j.rows; r0 += step) {
         const long nr = std::min(step, j.rows - r0);
         unrotate_rows_to_bf16(j, r0, nr, host.data());
-        if (cudaMemcpy(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
+        if (si_h2d_complete(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
                        (size_t)nr * j.width * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
             unrotate_cuda_ok("bf16 upload", name);
             cudaFree(dev);
@@ -410,7 +425,7 @@ void* unrotate_ternary_to_q4k(const UnrotateJob& j, const std::string& name, cud
         const long nr = std::min(step, j.rows - r0);
         unrotate_rows_to_bf16(j, r0, nr, host.data());
         const long n_chunk = nr * j.width;
-        if (cudaMemcpy(dev_bf16, host.data(), (size_t)n_chunk * 2,
+        if (si_h2d_complete(dev_bf16, host.data(), (size_t)n_chunk * 2,
                        cudaMemcpyHostToDevice) != cudaSuccess) {
             ok = unrotate_cuda_ok("staging upload", name);
             break;
@@ -551,6 +566,8 @@ struct Qwen35Model::Impl {
     // Guards the capture window against legacy-default-stream work issued by other threads.
     // See Qwen35Model::device_mutex() in the header for why this is required.
     std::recursive_mutex device_mu;
+    // Set while forward_token re-runs a step eagerly because its graph could not be captured.
+    bool capture_off = false;
     // CUDA-graph capture of the decode compute (captured once, replayed each token)
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
@@ -607,7 +624,34 @@ struct Qwen35Model::Impl {
         int out[kQwen35MaxPackedRows];
     };
     PackedSampleRows* packed_samp_host = nullptr;
+    // verify_grouped's per-row block-table pointer arrays (device) and their pinned staging.
+    const int** grp_dev_tables = nullptr;
+    const int** grp_dev_tables_win = nullptr;
+    const int** grp_host_tables = nullptr;   // [2 * kQwen35MaxPackedRows]: tables, then ring tables
+    // mixed_step's scratch, allocated on first use for kQwen35MaxPackedRows decode rows: the
+    // gathered block tables, device positions/lengths, the split-KV attention partials, the Q8_1
+    // rows and logits of the LM head, and the argmax (device + pinned host).
+    int* mix_btab = nullptr;
+    int* mix_pos_d = nullptr;
+    int* mix_seq_d = nullptr;
+    int* mix_host = nullptr;          // pinned: pos [32], seq [32], out [32]
+    float* mix_fa = nullptr;
+    void* mix_q81 = nullptr;
+    float* mix_logits = nullptr;
+    int* mix_d_out = nullptr;
+    int mix_btab_mbs = 0;
     PackedSampleRows* packed_samp_dev = nullptr;
+    // A sampled request's sampler while dflash_generate speculates it (see SpecHooks): each verify
+    // row i draws its token at sampler step step0 + i instead of taking the argmax.
+    struct VerifySampling {
+        bool on = false;
+        float temp = 0.f;
+        unsigned long long seed = 0;
+        int top_k = 0;
+        float top_p = 1.f;
+        unsigned long long step0 = 0;
+    };
+    VerifySampling vsamp;
 
     // Per-session parking lot for the AR decode graph.
     //
@@ -1035,8 +1079,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->d_denom_det=p_->alloc<float>(1);
     p_->d_shared_ids=p_->alloc<int>(1); p_->d_shared_w=p_->alloc<float>(1);
     int zero=0; float one=1.f;
-    cu(cudaMemcpy(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
-    cu(cudaMemcpy(p_->d_shared_w,&one,sizeof(float),cudaMemcpyHostToDevice),"shared w");
+    cu(si_h2d_complete(p_->d_shared_ids,&zero,sizeof(int),cudaMemcpyHostToDevice),"shared ids");
+    cu(si_h2d_complete(p_->d_shared_w,&one,sizeof(float),cudaMemcpyHostToDevice),"shared w");
     // Fused-expert + flash-decoding decode scratch (batch 1). Allocated here so
     // EVERY load path (set_weights / load_weights / load_gguf) has it — not just
     // GGUF. (fa_* NULL here is what crashed flash_decode_split on the non-GGUF path.)
@@ -1063,8 +1107,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->nv_ps_b = p_->alloc<float>(pw / 16 + 1);
     }
     if (cfg.dense_ffn && cfg.top_k > 0) {
-        cu(cudaMemcpy(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
-        cu(cudaMemcpy(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
+        cu(si_h2d_complete(p_->mf_ids, &zero, sizeof(int), cudaMemcpyHostToDevice), "dense expert id");
+        cu(si_h2d_complete(p_->mf_weights, &one, sizeof(float), cudaMemcpyHostToDevice), "dense expert w");
     }
     if (cfg.n_shared > 0) {
         p_->sx_h  = p_->alloc<float>(cfg.moe_ffn);
@@ -1155,7 +1199,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         // buffer once at load time and reuse it as that "weight").
         p_->emb_norm_ones = p_->alloc<bf16>(H);
         std::vector<bf16> ones(H, (bf16)0x3F80u);   // bf16 bit pattern for 1.0f
-        cudaMemcpy(p_->emb_norm_ones, ones.data(), (size_t)H * sizeof(bf16), cudaMemcpyHostToDevice);
+        si_h2d_complete(p_->emb_norm_ones, ones.data(), (size_t)H * sizeof(bf16), cudaMemcpyHostToDevice);
     }
     const int kmax = (p_->qdim > H) ? p_->qdim : H;          // largest projection input dim
     p_->aq8   = p_->alloc<signed char>(kmax);
@@ -1236,7 +1280,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen); cudaFree(p_->emb_norm_ones);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
-    // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
+    cudaFree(p_->spec_lin_snap); cudaFree(p_->spec_conv_snap);
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
@@ -1252,6 +1296,17 @@ Qwen35Model::~Qwen35Model() {
     if (p_->packed_dev_tables_win) cudaFree(p_->packed_dev_tables_win);
     if (p_->packed_host_tables_win) cudaFreeHost(p_->packed_host_tables_win);
     if (p_->packed_samp_host) cudaFreeHost(p_->packed_samp_host);
+    if (p_->grp_dev_tables) cudaFree(p_->grp_dev_tables);
+    if (p_->grp_dev_tables_win) cudaFree(p_->grp_dev_tables_win);
+    if (p_->grp_host_tables) cudaFreeHost(p_->grp_host_tables);
+    if (p_->mix_btab) cudaFree(p_->mix_btab);
+    if (p_->mix_pos_d) cudaFree(p_->mix_pos_d);
+    if (p_->mix_seq_d) cudaFree(p_->mix_seq_d);
+    if (p_->mix_host) cudaFreeHost(p_->mix_host);
+    if (p_->mix_fa) cudaFree(p_->mix_fa);
+    if (p_->mix_q81) cudaFree(p_->mix_q81);
+    if (p_->mix_logits) cudaFree(p_->mix_logits);
+    if (p_->mix_d_out) cudaFree(p_->mix_d_out);
     if (p_->packed_samp_dev) cudaFree(p_->packed_samp_dev);
     for (auto& kv : p_->parked_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
@@ -1436,8 +1491,8 @@ bool Qwen35Model::set_pending_vision(const float* emb, const int* positions, int
     if (cudaMalloc((void**)&s.d_vision_pos, (size_t)n_img * sizeof(int)) != cudaSuccess) {
         cudaFree(s.d_vision_emb); s.d_vision_emb = nullptr; return false;
     }
-    if (cudaMemcpy(s.d_vision_emb, h.data(), n * sizeof(bf16), cudaMemcpyHostToDevice) != cudaSuccess
-     || cudaMemcpy(s.d_vision_pos, positions, (size_t)n_img * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(s.d_vision_emb, h.data(), n * sizeof(bf16), cudaMemcpyHostToDevice) != cudaSuccess
+     || si_h2d_complete(s.d_vision_pos, positions, (size_t)n_img * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         clear_pending_vision(); return false;
     }
     s.vision_n = n_img;
@@ -1457,7 +1512,7 @@ bool Qwen35Model::set_pending_mrope(const int* positions, int n_tokens, int deco
     if (!positions || n_tokens <= 0) return false;
     const size_t n = (size_t)n_tokens * 3;
     if (cudaMalloc((void**)&s.d_mrope_pos, n * sizeof(int)) != cudaSuccess) return false;
-    if (cudaMemcpy(s.d_mrope_pos, positions, n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (si_h2d_complete(s.d_mrope_pos, positions, n * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
         clear_pending_mrope();
         return false;
     }
@@ -1777,7 +1832,25 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     // always safe to (re)capture -- either the plain decode graph (dflash_cap false) or the
     // dflash decode graph (dflash_cap true, via the row-independent stage buffer); only the
     // prefill/prompt path (sample=false) still avoids capturing while dflash_cap is on.
-    const bool capturing_graph = sample || !dflash_cap;
+    const bool capturing_graph = (sample || !dflash_cap) && !s.capture_off;
+    // A captured step's kernels are recorded, not run: if the graph then fails to end or
+    // instantiate (out of memory, say), nothing has executed -- no KV append, no recurrent-state
+    // update, no token. Returning as if it had ran the NEXT step on stale state and handed back the
+    // previous token (packed_decode_check at 24 rows with 1 MB free decoded garbage). Run the step
+    // again with capture off instead; everything above this point is idempotent host-side setup.
+    auto run_eager = [&]() -> int {
+        static bool said = false;   // once: under memory pressure every step can land here
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[qwen35] graph capture failed at position %d; running steps eagerly\n",
+                    position);
+        }
+        s.capture_off = true;
+        const int r = forward_token(token_id, position, sample, temperature, seed, sample_step,
+                                    top_k, top_p, presence_penalty, frequency_penalty);
+        s.capture_off = false;
+        return r;
+    };
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
@@ -3124,8 +3197,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
     dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
     if (!sample) {
-        if (capturing_graph &&
-            finish_capture(st, &s.cu_prefill_graph, &s.cu_prefill_exec, "prefill graph capture")) {
+        if (capturing_graph) {
+            if (!finish_capture(st, &s.cu_prefill_graph, &s.cu_prefill_exec, "prefill graph capture"))
+                return run_eager();
             s.graph_prefill_ready = true;
             s.graph_prefill_attn_mode = attn_graph_mode;
             cu(cudaGraphLaunch(s.cu_prefill_exec, st), "prefill graph launch (first)");
@@ -3228,7 +3302,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
     if (capturing_graph && dflash_cap) {
-        if (finish_capture(st, &s.cu_dflash_graph, &s.cu_dflash_exec, "dflash graph capture")) {
+        if (!finish_capture(st, &s.cu_dflash_graph, &s.cu_dflash_exec, "dflash graph capture"))
+            return run_eager();
+        {
             s.dflash_graph_ready = true;
             s.dflash_graph_attn_mode = attn_graph_mode;
             s.dflash_graph_sparse = sparse_on;
@@ -3244,7 +3320,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
         }
     } else if (capturing_graph) {
-        if (finish_capture(st, &s.cu_graph, &s.cu_exec, "decode graph capture")) {
+        if (!finish_capture(st, &s.cu_graph, &s.cu_exec, "decode graph capture"))
+            return run_eager();
+        {
             s.graph_ready = true;
             s.graph_attn_mode = attn_graph_mode;
             s.graph_sparse = sparse_on;
@@ -3944,6 +4022,43 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // Give the NVFP4 LM-head operand back. It exists only to serve a packed decode wide enough to
 // want a GEMM, and it is the one piece of weight residency in this model that a run can decide it
 // does not need.
+// Bring an offloaded draft back, but only into room it leaves room beside: right after a busy
+// stretch, or another thread's out-of-memory offload, the device is still full, and a draft restored
+// there -- then pinned for a whole group -- leaves the group's prefills and every new session no
+// arena (AIPerf 8K prompts at c16 after a chat cell: 0.37x). The join's own room check covers what
+// a join needs; this keeps SPARKINFER_DRAFT_RESTORE_HEADROOM_MB beside the draft itself. False,
+// still offloaded, when there is no room. Callers hold the device mutex.
+template <class Impl>
+static bool restore_draft_with_room(Impl& s) {
+    if (!s.dflash_draft) return false;
+    if (!s.dflash_draft->offloaded()) return true;
+    static const size_t headroom = [] {
+        const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
+        const long long mb = e ? atoll(e) : 1024LL;
+        return (size_t)(mb < 0 ? 0 : mb) << 20;
+    }();
+    size_t fb = 0, tb = 0;
+    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || fb < s.dflash_draft->footprint_bytes() + headroom)
+        return false;
+    return s.dflash_draft->restore();
+}
+
+// A loaded draft is the one large allocation that can step aside at no cost to a request in
+// flight: it is not reading anything unless a speculative prefill (capture on) or group is
+// running, and it comes back at the same addresses (DFlashDraftModel::offload). On a 32 GB card a
+// burst of 16 8K-token prompts beside it had no room for its prefill arena, and the pass fell to
+// the token loop -- 38 tok/s against 167 without the draft.
+template <class Impl>
+static bool offload_idle_draft(Impl& s, const char* what) {
+    if (!s.dflash_draft || s.dflash_capture || s.dflash_draft->offloaded()) return false;
+    cudaGetLastError();   // clear the failed allocation that brought us here
+    const size_t b = s.dflash_draft->offload();
+    if (!b) return false;
+    fprintf(stderr, "[spec] draft off the device: %s did not fit beside it (%.2f GB freed)\n",
+            what, (double)b / 1e9);
+    return true;
+}
+
 // Give the decode shadow's ternary copy back; decode then reads the folded weights, exactly as
 // with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
 // first and recapture on the next step. Returns whether anything was freed.
@@ -4040,23 +4155,38 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // 1-7 tokens through forward_token: the decode step, ~10 ms each, and the arithmetic every
     // later token gets anyway. A prefix-cache checkpoint always falls inside the body (it is at
     // least 16 tokens short of the end). Not for a pass with image or MRoPE staging, whose rows
-    // are the whole prompt's, or a DSpark hidden-state capture, which records the pass itself.
+    // are the whole prompt's. A DSpark hidden-state capture splits the same way -- the body pass
+    // records its rows at their positions and the tail's go straight to the context buffer -- so a
+    // speculated prompt prefills with the arithmetic, and at the speed, of an ordinary one.
     // Split this way, prefill tok/s at 131 / 262 / 518 / 1030 / 2054 / 4102 / 8210 tokens went
     // 1,297 -> 2,242 / 2,372 -> 2,925 / 3,817 -> 4,886 / 5,455 -> 7,813 / 7,281 -> 10,914 /
     // 7,291 -> 13,039 / 7,574 -> 14,350; 135 (the worst tail, seven decode steps behind a 128-row
     // pass) still gains, and aligned lengths do not change. SPARKINFER_PREFILL_ALIGN8_MIN is the
-    // smallest body split this way (0 turns it off).
+    // smallest body split this way (0 turns it off). It was 128 while the tail ran as decode steps;
+    // with the tail one verify forward (ingest_tail_rows) the split pays from an 8-row body up --
+    // TTFT p50 of a lone request at 9 / 20 / 47 / 77 / 100 prompt tokens, 81 / 82 / 84 / 86 / 88 ->
+    // 25 / 26 / 31 / 30 / 29 ms, and a chat prompt is almost always that short.
     static const int align8_min = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
-        const int v = e ? atoi(e) : 128;
+        const int v = e ? atoi(e) : 8;
         return v < 0 ? 0 : v;
     }();
     const int body = n & ~7;
     if (align8_min > 0 && body >= align8_min && body < n && !s.w.layers.empty() &&
-        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos && !s.dflash_capture) {
+        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos) {
         if (prefill_batched(prompt_ids, body, false, pos0) < 0) return -1;   // nothing landed
+        // One forward for the whole tail where the verify path takes it (ingest_tail_rows);
+        // decode steps otherwise. A seed whose logprob is wanted keeps the decode steps.
+        if (!want_seed_logprob) {
+            const int tail_seed = ingest_tail_rows(prompt_ids + body, n - body, pos0 + body);
+            if (tail_seed >= 0 && tail_seed < s.cfg.vocab) return tail_seed;
+        }
         int seed = -1;
-        for (int i = body; i < n; ++i) seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+        for (int i = body; i < n; ++i) {
+            if (s.dflash_capture) set_dflash_capture_row(0);
+            seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+            if (s.dflash_capture) dflash_stash_capture(pos0 + i);   // the rows a draft reads
+        }
         // The last step counted its pick toward presence/frequency penalties, which a batched
         // prefill's seed never is: take that one count back so the request sees the same counts
         // whichever way its prompt was split. forward_token has synchronized its stream.
@@ -4085,6 +4215,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     // the operand is the one with MORE headroom at the moment of the decision -- the KV cache and
     // the arena are both taken afterwards. The prompt length is the signal that actually
     // separates them.
+    //
+    // Keeping it longer measured worse, not better: yielding only from 16384 tokens left the head
+    // resident through a chat workload (1,077-token prompts) and cost more in prefill than it gave
+    // back in decode -- c32 chat 1,082 -> 963 tok/s, packed prefill time +32% (its arena is carved
+    // from what the head holds), decode step 17.5 -> 17.2 ms. A shorter pass whose arena does not
+    // fit beside the head still gives it up and retries (below).
     static const int kHeadFp4YieldTokens = [] {
         const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
         const int v = e ? atoi(e) : 1024;
@@ -4161,6 +4297,20 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
         ctx.bonsai_dec_head = nullptr;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
+    // A loaded, idle draft before the head: the draft comes back when speculation resumes, and
+    // the head does not.
+    if (seed < 0 && scratch_oom && offload_idle_draft(s, "a prefill's arena")) {
+        scratch_oom = false;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
+    // ...and the NVFP4 head, the other decode-only operand that can be given back.
+    if (seed < 0 && scratch_oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+        fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released: a %d-token prefill's arena "
+                        "did not fit beside it\n", n);
+        release_lm_head_fp4();
+        scratch_oom = false;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
     // Consume it. This is PER-REQUEST state, not model state: leaving it set would splice the
     // previous request's image into the next prompt, which would produce fluent, confident text
     // about an image the caller never sent. Cleared on every path out, including the failure
@@ -4216,13 +4366,43 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     return seed;
 }
 
+// A snapshot's bytes; see the snapshot pool below (pinned_snapshot_buffer) for why they move.
+struct Qwen35Model::SnapshotBuffer {
+    std::mutex mu;
+    void* data = nullptr;
+    size_t bytes = 0;
+    bool pinned = false;
+    ~SnapshotBuffer();
+};
+
+namespace {
+// Defined with the snapshot pool below.
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes, bool pool_only = false);
+void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b);
+void snapshot_pool_warm(size_t bytes, size_t n);
+size_t snapshot_pool_cap_bytes();
+}  // namespace
+
 bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
-                                        const int* lens, int n_prompts, int* seeds,
-                                        const PackedSampling* sampling) {
+                                        const int* lens_in, int n_prompts, int* seeds,
+                                        const PackedSampling* sampling, const int* ckpt_rows,
+                                        RecurrentStateSnapshot* snaps) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
-    if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
-    if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn) return false;
+    if (!seq_ids || !prompts || !lens_in || !seeds || n_prompts < 2) return false;
+    // MoE checkpoints pack too (Qwen3.6-35B-A3B): the routed FFN is per token, and the mixed steps
+    // already carry several prompts through the same pass. Left dense-only, every prompt of a
+    // burst on Qwen3.6 took a pass of its own -- 32 arriving 1K-token prompts ran at half vLLM's
+    // rate. SPARKINFER_PACK_MOE=0 keeps MoE models on one pass per prompt.
+    static const bool pack_moe = [] {
+        const char* e = getenv("SPARKINFER_PACK_MOE");
+        return !(e && e[0] == '0');
+    }();
+    if (!s.gguf || !s.cfg.hybrid || !(s.cfg.dense_ffn || pack_moe)) return false;
+    if (ckpt_rows && !snaps) return false;
+    // lens: what the pass itself ingests; one prompt may be trimmed below (see `trimmed`).
+    std::vector<int> lens_v(lens_in, lens_in + n_prompts);
+    const int* lens = lens_v.data();
     // Muse Glimmer carries no recurrent state; its pack is attention and FFN only.
     // SPARKINFER_MUSE_PACKED_INGEST=0 keeps it on one prefill per prompt (A/B in one binary).
     static const bool muse_pack = [] {
@@ -4249,6 +4429,37 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         lin_state[(size_t)i] = it->second.lin_state;
         lin_conv[(size_t)i] = it->second.lin_conv_state;
     }
+    // The block-scaled NVFP4 GEMMs take a multiple of 8 rows, and a pass of any other length runs
+    // every layer on the fallback (see prefill_batched): a pack of 1,076-token chat prompts lost
+    // FP4 for all of them. Run one prompt's last total % 8 tokens as decode steps after the pass
+    // instead, as prefill_batched does for one prompt -- a prompt that keeps 16 rows past its
+    // checkpoint, so the checkpoint's second part is still its own.
+    constexpr int kMinSegment = 16;
+    int trimmed = -1, trim_r = 0;
+    static const int align8_min = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
+        const int v = e ? atoi(e) : 128;
+        return v < 0 ? 0 : v;
+    }();
+    if (align8_min > 0 && !s.cfg.muse_glimmer && (total & 7) && !s.w.layers.empty() &&
+        s.w.layers[0].gate_fp4) {
+        const int r = total & 7;
+        for (int i = n_prompts - 1; i >= 0 && trimmed < 0; --i) {
+            const int keep = lens_v[(size_t)i] - r;
+            const int ck = ckpt_rows ? ckpt_rows[i] : 0;
+            if (keep >= kMinSegment && (ck <= 0 || keep - ck >= kMinSegment)) trimmed = i;
+        }
+        if (trimmed >= 0) {
+            trim_r = r;
+            lens_v[(size_t)trimmed] -= r;
+            total -= r;
+            for (int i = trimmed + 1; i < n_prompts; ++i) off[(size_t)i] -= r;
+        }
+    }
+    for (int i = 0; ckpt_rows && i < n_prompts; ++i) {
+        const int ck = ckpt_rows[i];
+        if (ck > 0 && (ck < kMinSegment || lens[i] - ck < kMinSegment)) return false;
+    }
     // Each prompt is its own pass as far as a windowed ring is concerned (prefill_batched_run
     // checks the longest one); the pack as a whole only has to fit the single-pass arena.
     if (s.kv->windowed()) {
@@ -4264,6 +4475,30 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     std::vector<int> ids;
     ids.reserve((size_t)total);
     for (int i = 0; i < n_prompts; ++i) ids.insert(ids.end(), prompts[i], prompts[i] + lens[i]);
+    // Snapshot buffers for the prompts that take a checkpoint.
+    const size_t ck_st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+                               s.cfg.linear_head_dim * s.cfg.linear_head_dim * sizeof(float);
+    const size_t ck_cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                               s.linear_qkvdim * sizeof(bf16);
+    std::vector<std::shared_ptr<SnapshotBuffer>> ck_bufs((size_t)n_prompts);
+    std::vector<void*> ck_host((size_t)n_prompts, nullptr);
+    std::vector<int> ck_row((size_t)n_prompts, 0);
+    bool any_ckpt = false;
+    for (int i = 0; ckpt_rows && i < n_prompts; ++i) {
+        if (ckpt_rows[i] <= 0) continue;
+        if (!linear) return false;
+        // From the warmed pool only. A burst bigger than the pool skips the checkpoints it has no
+        // buffer for (those prompts are just not offered to the prefix cache) rather than pinning
+        // fresh memory mid-pass: that driver call stalls the step, and a pack's checkpoints are
+        // all taken in the same pass. The migration thread hands buffers back as it drains.
+        ck_bufs[(size_t)i] = pinned_snapshot_buffer(ck_st_bytes + ck_cv_bytes, /*pool_only=*/true);
+        if (!ck_bufs[(size_t)i]) continue;
+        ck_host[(size_t)i] = ck_bufs[(size_t)i]->data;
+        // The pass writes the GDN layers' windows; the attention layers' slots stay zero.
+        memset(static_cast<char*>(ck_host[(size_t)i]) + ck_st_bytes, 0, ck_cv_bytes);
+        ck_row[(size_t)i] = ckpt_rows[i];
+        any_ckpt = true;
+    }
     for (int i = 0; i < n_prompts; ++i) {
         // Position-0 batched prefill writes the whole recurrent state as fp32 (see prefill_batched).
         s.sessions[seq_ids[i]].lin_state_b16 = false;
@@ -4339,12 +4574,76 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         ctx.multi_lin_state = lin_state.data() + b;
         ctx.multi_lin_conv = lin_conv.data() + b;
         ctx.multi_seed = seeds + b;
+        if (any_ckpt) {
+            ctx.multi_ckpt_row = ck_row.data() + b;
+            ctx.multi_ckpt_host = ck_host.data() + b;
+            ctx.ckpt_state_bytes = ck_st_bytes;
+        }
         sampler.base = b;
-        if (prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0) < 0) return false;
+        bool oom = false;
+        ctx.scratch_oom_out = &oom;
+        int r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        if (r < 0 && oom && offload_idle_draft(s, "a packed prefill's arena")) {
+            oom = false;
+            r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        }
+        // A pass whose arena did not fit ran nothing: give the NVFP4 head back and retry, as the
+        // one-prompt pass does.
+        if (r < 0 && oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+            fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released: a %d-row packed "
+                            "prefill's arena did not fit beside it\n", rows);
+            release_lm_head_fp4();
+            oom = false;
+            r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        }
+        ctx.scratch_oom_out = nullptr;
+        if (r < 0) return false;
         b = e;
+    }
+    // The trimmed prompt's last tokens, one decode step each on its own session; its seed is the
+    // last step's pick, redrawn with its sampler as the pass would have redrawn it.
+    if (trimmed >= 0) {
+        const uint64_t sid = seq_ids[trimmed];
+        activate_session(sid);
+        const int full = lens_in[trimmed];
+        int seed = ingest_tail_rows(prompts[trimmed] + full - trim_r, trim_r, full - trim_r);
+        const bool stepped = !(seed >= 0 && seed < s.cfg.vocab);
+        for (int t = full - trim_r; stepped && t < full; ++t) {
+            seed = forward_token(prompts[trimmed][t], t, t + 1 == full);
+            if (seed < 0) return false;
+        }
+        // The last step counted its pick toward presence/frequency penalties, which a batched
+        // prefill's seed never is (see prefill_batched): take that count back.
+        if (stepped && seed < s.cfg.vocab && s.penalty_counts) {
+            int count = 0;
+            cu(cudaMemcpyAsync(&count, s.penalty_counts + seed, sizeof(int), cudaMemcpyDeviceToHost,
+                               s.stream), "pack tail count read");
+            cu(cudaStreamSynchronize(s.stream), "pack tail count sync");
+            if (count > 0) {
+                --count;
+                cu(cudaMemcpyAsync(s.penalty_counts + seed, &count, sizeof(int), cudaMemcpyHostToDevice,
+                                   s.stream), "pack tail count write");
+                cu(cudaStreamSynchronize(s.stream), "pack tail count write sync");
+            }
+        }
+        if (sampling && sampling->temperature && sampling->temperature[trimmed] > 0.f) {
+            const int drawn = sample_logits_row(s, sampling->temperature[trimmed], sampling->seed[trimmed],
+                                                sampling->step[trimmed], sampling->top_k[trimmed],
+                                                sampling->top_p[trimmed]);
+            if (drawn >= 0) seed = drawn;
+        }
+        seeds[trimmed] = seed;
     }
     for (int i = 0; i < n_prompts; ++i)
         if (seeds[i] < 0 || seeds[i] >= s.cfg.vocab) return false;
+    // The pass synchronized its stream to read the seeds back, so every snapshot has landed.
+    for (int i = 0; any_ckpt && i < n_prompts; ++i) {
+        if (!ck_bufs[(size_t)i]) continue;
+        snapshot_filled(ck_bufs[(size_t)i]);
+        snaps[i].host = std::move(ck_bufs[(size_t)i]);
+        snaps[i].state_bytes = ck_st_bytes;
+        snaps[i].conv_bytes = ck_cv_bytes;
+    }
     return true;
 }
 
@@ -4388,7 +4687,7 @@ int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want
         const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
         prefill_hold_arena(false);
         // A window that declines -- a path with no start position (Muse's rolling-window
-        // attention, a DSpark capture), or a scratch allocation that failed even at window size
+        // attention), or a scratch allocation that failed even at window size
         // -- leaves [0, pos) correct in the cache and stops there: the caller finishes the rest
         // token by token rather than recomputing what already landed.
         if (seed < 0) return -1;
@@ -4459,6 +4758,13 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
         if (attempt == 0 && release_bonsai_shadow(s)) continue;
+        // An idle draft next: it comes back when speculation resumes; the head below does not.
+        if (attempt <= 1 && offload_idle_draft(s, "a session's state")) continue;
+        if (attempt <= 2 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+            fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
+            release_lm_head_fp4();
+            continue;
+        }
         break;
     }
     if (!alloc_ok) {
@@ -4495,6 +4801,23 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     if (!prompt_ids || start <= 0 || end <= start) return -1;
     Impl& s = *p_;
     const int n = end - start;
+    // A resume of 8 tokens or fewer -- the stretch after a prompt's last prefix-cache checkpoint,
+    // which a chat prompt's final checkpoint (the start of its assistant turn) leaves at 1-7 tokens
+    // -- takes the verify path's one forward (ingest_tail_rows), as the tail of an aligned pass
+    // does, instead of a whole prefill pass of its own: that pass ran every layer's batched arms
+    // for a handful of rows and was ~70 ms of each chat request's prefill under load.
+    // Scoped like the aligned pass's own tail (prefill_batched): NVFP4 checkpoints, whose verify
+    // path this is measured on; the other stacks keep the pass.
+    // Up to 32 tokens: the verify arena's width (kVerifyMaxRows). A chat prompt's two checkpoints
+    // (end of the system prompt, start of the assistant turn) leave segments of 16-ish tokens
+    // between them, and a resume pass for 16 rows cost ~50 ms against one verify forward's ~15.
+    if (n <= 32 && !want_seed_logprob && !s.w.layers.empty() && s.w.layers[0].gate_fp4) {
+        const int seed = ingest_tail_rows(prompt_ids + start, n, start);
+        if (seed >= 0 && seed < s.cfg.vocab) {
+            if (out_done) *out_done = n;
+            return seed;
+        }
+    }
     const int window = prefill_window_tokens(s.kv);
     int done = 0;
     auto run = [&](int step) -> int {
@@ -4533,55 +4856,220 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     return seed;
 }
 
-// Pinned host buffers for recurrent-state snapshots, reused instead of allocated per snapshot.
-// cudaHostAlloc pins every page of a snapshot (~205 MB on Qwen3.8-27B) and cudaFreeHost unpins
-// them again, and a chat request past the checkpoint minimum takes one snapshot per checkpoint
-// while its prefill waits on it: under load that showed up as ~90 ms of prefill per request that
-// the same server without the prefix cache did not pay. A buffer comes back here when the last
-// snapshot holding it goes -- the cache evicting its entry, or a job retiring without offering
-// it -- and at most kSnapshotPoolMax wait unused. Never destroyed: a snapshot can outlive every
-// other static at exit. SPARKINFER_SNAPSHOT_POOL=0 allocates and frees per snapshot as before.
+// Host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B).
+//
+// The device copy that fills a snapshot runs asynchronously -- in the middle of a checkpointed
+// prefill pass -- so the destination has to be pinned. Pinning is the expensive part: on an RTX
+// 5090 box cudaHostAlloc of 205 MB takes ~97 ms, and pinning on another thread does not hide it,
+// because the driver stalls every other CUDA call for the duration (a background
+// cudaHostAlloc/cudaHostRegister held a foreground kernel+sync up for 98/66 ms). A chat request
+// past the checkpoint minimum takes a snapshot while its prefill waits, and the prefix cache keeps
+// up to 32 of them, so returning buffers on eviction only helped once the cache was full: before
+// that every request pinned a fresh buffer on its critical path (72-83 ms of a 204 ms prefill for
+// a 1,076-token chat prompt).
+//
+// So a snapshot is filled in a pinned buffer from a small free list, and once the copy has landed
+// a background thread moves its bytes into pageable memory (plain memcpy, no CUDA call, so nothing
+// to stall) and hands the pinned buffer back. After the first request or two no request pins
+// anything. A restore from pageable memory costs ~19 ms instead of ~8 ms, on a cache hit only.
+// Pageable buffers are reused too: first-touching 205 MB costs as much as pinning it.
+// SPARKINFER_SNAPSHOT_MIGRATE=0 keeps every snapshot in its pinned buffer (the buffers still come
+// back to the free list when the snapshot goes); SPARKINFER_SNAPSHOT_POOL=0 also stops reusing
+// them. Nothing here is ever destroyed: a snapshot can outlive every other static at exit.
 namespace {
-constexpr size_t kSnapshotPoolMax = 8;
+constexpr size_t kSnapshotPoolMax = 8;   // at least this many free buffers per list
+// ...and up to this many bytes of them (SPARKINFER_SNAPSHOT_POOL_MB, default 4096). A count of 8
+// let a burst of chat prompts -- each packed prompt takes its checkpoint snapshot in the same pass
+// -- pin and free a fresh buffer for all but eight of them: 32 arriving 1K-token prompts on
+// Qwen3.6 (63 MB a snapshot) spent ~0.4 s of their ~1.4 s in cudaHostAlloc / cudaFreeHost.
+size_t snapshot_pool_cap_bytes() {
+    static const size_t v = [] {
+        const char* e = getenv("SPARKINFER_SNAPSHOT_POOL_MB");
+        const long long mb = e ? atoll(e) : 4096;
+        return (size_t)(mb > 0 ? mb : 0) << 20;
+    }();
+    return v;
+}
 struct SnapshotPool {
     std::mutex mu;
     size_t bytes = 0;
-    std::vector<void*> free;
+    std::vector<void*> pinned, pageable;   // free buffers of `bytes` each
+    // The migration thread's queue.
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<Qwen35Model::SnapshotBuffer>> todo;
+    bool worker_started = false;
+    bool warmed = false;   // snapshot_pool_warm filled the lists for `bytes`
 };
 SnapshotPool& snapshot_pool() {
     static SnapshotPool* p = new SnapshotPool;
     return *p;
 }
-std::shared_ptr<void> pinned_snapshot_buffer(size_t bytes) {
-    static const bool pooled = [] {
+bool snapshot_pool_on() {
+    static const bool v = [] {
         const char* e = getenv("SPARKINFER_SNAPSHOT_POOL");
         return !(e && e[0] == '0');
     }();
-    void* host = nullptr;
-    if (pooled) {
+    return v;
+}
+bool snapshot_migrate_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_SNAPSHOT_MIGRATE");
+        return snapshot_pool_on() && !(e && e[0] == '0');
+    }();
+    return v;
+}
+// Called with p.mu held: a different model's snapshot size empties the free lists.
+void snapshot_pool_resize(SnapshotPool& p, size_t bytes) {
+    if (p.bytes == bytes) return;
+    p.warmed = false;
+    for (void* f : p.pinned) cudaFreeHost(f);
+    for (void* f : p.pageable) free(f);
+    p.pinned.clear();
+    p.pageable.clear();
+    p.bytes = bytes;
+}
+void snapshot_release(void* data, size_t bytes, bool pinned) {
+    if (!data) return;
+    if (snapshot_pool_on()) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
-        if (p.bytes == bytes && !p.free.empty()) {
-            host = p.free.back();
-            p.free.pop_back();
+        std::vector<void*>& list = pinned ? p.pinned : p.pageable;
+        if (p.bytes == bytes && (list.size() < kSnapshotPoolMax ||
+                                 (list.size() + 1) * bytes <= snapshot_pool_cap_bytes())) {
+            list.push_back(data);
+            return;
         }
     }
-    if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocDefault) != cudaSuccess || !host))
-        return nullptr;
-    if (!pooled) return std::shared_ptr<void>(host, [](void* h) { cudaFreeHost(h); });
-    return std::shared_ptr<void>(host, [bytes](void* h) {
+    if (pinned) cudaFreeHost(data);
+    else free(data);
+}
+// A pinned buffer for a snapshot about to be filled by a device copy. pool_only: once the pool has
+// been warmed for this size (a server with the prefix cache on), take one from the free list or
+// return nullptr -- never pin a new one mid-pass (see the packed prefill's use). An unwarmed pool
+// pins on demand as before.
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes, bool pool_only) {
+    void* host = nullptr;
+    bool warmed = false;
+    if (snapshot_pool_on()) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
-        if (p.bytes != bytes) {
-            for (void* f : p.free) cudaFreeHost(f);
-            p.free.clear();
-            p.bytes = bytes;
+        snapshot_pool_resize(p, bytes);
+        warmed = p.warmed;
+        if (!p.pinned.empty()) {
+            host = p.pinned.back();
+            p.pinned.pop_back();
         }
-        if (p.free.size() < kSnapshotPoolMax) p.free.push_back(h);
-        else cudaFreeHost(h);
-    });
+    }
+    if (!host && pool_only && warmed) return nullptr;
+    if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocPortable) != cudaSuccess || !host))
+        return nullptr;
+    auto b = std::make_shared<Qwen35Model::SnapshotBuffer>();
+    b->data = host;
+    b->bytes = bytes;
+    b->pinned = true;
+    return b;
+}
+void snapshot_migrate_worker() {
+    SnapshotPool& p = snapshot_pool();
+    for (;;) {
+        std::shared_ptr<Qwen35Model::SnapshotBuffer> b;
+        void* dst = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(p.mu);
+            p.cv.wait(lock, [&] { return !p.todo.empty(); });
+            b = std::move(p.todo.front());
+            p.todo.pop_front();
+            if (p.bytes == b->bytes && !p.pageable.empty()) {
+                dst = p.pageable.back();
+                p.pageable.pop_back();
+            }
+        }
+        // The last holder may already be gone (the job failed, the cache refused it). The pageable
+        // buffer taken for it goes back to the pool, not out of scope with this iteration.
+        if (b.use_count() == 1) {
+            if (dst) snapshot_release(dst, b->bytes, false);
+            continue;
+        }
+        if (!dst) {
+            dst = malloc(b->bytes);
+            if (!dst) continue;
+        }
+        // Read without the buffer's lock: nothing writes a filled snapshot, and a concurrent
+        // restore only reads it too. Swap under the lock, so a restore never sees a buffer that
+        // is being handed back.
+        std::memcpy(dst, b->data, b->bytes);
+        void* old = nullptr;
+        {
+            std::lock_guard<std::mutex> g(b->mu);
+            old = b->data;
+            b->data = dst;
+            b->pinned = false;
+        }
+        snapshot_release(old, b->bytes, true);
+    }
+}
+// Called once a snapshot's device copy has landed.
+// Fill the free lists ahead of serving: `n` pinned buffers of `bytes` (and as many pageable ones,
+// first-touched, for the migration thread to move snapshots into). Each list is bounded by the
+// caller's `n` (warm_snapshot_pool keeps n * bytes within SPARKINFER_SNAPSHOT_POOL_MB), so the two
+// together hold at most twice that in host memory. Pinning a 63 MB buffer is a
+// long driver call that stalls the CUDA work around it; done for every snapshot of a burst, it was
+// ~1 s of a 4 s window of 32-prompt bursts on Qwen3.6 with the GPU idle a third of the time.
+void snapshot_pool_warm(size_t bytes, size_t n) {
+    if (!snapshot_pool_on() || bytes == 0 || n == 0) return;
+    SnapshotPool& p = snapshot_pool();
+    std::lock_guard<std::mutex> lock(p.mu);
+    snapshot_pool_resize(p, bytes);
+    while (p.pinned.size() < n) {
+        void* h = nullptr;
+        if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) != cudaSuccess || !h) break;
+        p.pinned.push_back(h);
+    }
+    while (snapshot_migrate_on() && p.pageable.size() < n) {
+        void* h = malloc(bytes);
+        if (!h) break;
+        std::memset(h, 0, bytes);   // first touch now, not under a burst
+        p.pageable.push_back(h);
+    }
+    p.warmed = !p.pinned.empty();
+}
+void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b) {
+    if (!b || !b->pinned || !snapshot_migrate_on()) return;
+    SnapshotPool& p = snapshot_pool();
+    std::lock_guard<std::mutex> lock(p.mu);
+    if (!p.worker_started) {
+        std::thread(snapshot_migrate_worker).detach();
+        p.worker_started = true;
+    }
+    p.todo.push_back(b);
+    p.cv.notify_one();
 }
 }  // namespace
+
+Qwen35Model::SnapshotBuffer::~SnapshotBuffer() { snapshot_release(data, bytes, pinned); }
+
+std::vector<char> Qwen35Model::snapshot_bytes(const RecurrentStateSnapshot& snap) {
+    std::vector<char> out;
+    if (!snap.host) return out;
+    std::lock_guard<std::mutex> g(snap.host->mu);
+    if (!snap.host->data) return out;
+    const char* d = static_cast<const char*>(snap.host->data);
+    out.assign(d, d + snap.host->bytes);
+    return out;
+}
+
+void Qwen35Model::warm_snapshot_pool() {
+    Impl& s = *p_;
+    if (!needs_linear_state(s.cfg)) return;
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                            s.linear_qkvdim * sizeof(bf16);
+    const size_t bytes = st_bytes + cv_bytes;
+    // Two bursts' worth (64 prompts), within the pool's byte cap.
+    const size_t n = std::min<size_t>(64, bytes ? snapshot_pool_cap_bytes() / bytes : 0);
+    snapshot_pool_warm(bytes, n);
+}
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
@@ -4598,9 +5086,9 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
                             s.linear_qkvdim * sizeof(bf16);
-    std::shared_ptr<void> owned = pinned_snapshot_buffer(st_bytes + cv_bytes);
+    std::shared_ptr<SnapshotBuffer> owned = pinned_snapshot_buffer(st_bytes + cv_bytes);
     if (!owned) return false;
-    void* host = owned.get();
+    void* host = owned->data;
     // Prefill may still have work queued on any of the model's streams; the state is final only
     // once all of it has run.
     cudaDeviceSynchronize();
@@ -4609,6 +5097,7 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
     cu(cudaMemcpyAsync(static_cast<char*>(host) + st_bytes, b.lin_conv_state, cv_bytes,
                        cudaMemcpyDeviceToHost, s.stream), "prefix-cache conv snapshot");
     if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    snapshot_filled(owned);
     out.host = std::move(owned);
     out.state_bytes = st_bytes;
     out.conv_bytes = cv_bytes;
@@ -4645,13 +5134,13 @@ int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, 
                             s.cfg.linear_head_dim * sizeof(float);
     const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim *
                             sizeof(bf16);
-    std::vector<std::shared_ptr<void>> bufs((size_t)n_ckpts);
+    std::vector<std::shared_ptr<SnapshotBuffer>> bufs((size_t)n_ckpts);
     std::vector<void*> host((size_t)n_ckpts);
     std::vector<int> rows((size_t)n_ckpts);
     for (int i = 0; i < n_ckpts; ++i) {
         bufs[(size_t)i] = pinned_snapshot_buffer(st_bytes + cv_bytes);
         if (!bufs[(size_t)i]) return -1;
-        host[(size_t)i] = bufs[(size_t)i].get();
+        host[(size_t)i] = bufs[(size_t)i]->data;
         // The pass writes the GDN layers' windows; the attention layers' slots, which nothing
         // reads, are zero rather than whatever a reused buffer held.
         memset(static_cast<char*>(host[(size_t)i]) + st_bytes, 0, cv_bytes);
@@ -4671,6 +5160,7 @@ int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, 
     // A pass declines before its first kernel runs (see prefill_batched_resume), so nothing landed.
     if (seed < 0) return -1;
     for (int i = 0; i < n_ckpts; ++i) {
+        snapshot_filled(bufs[(size_t)i]);
         snaps[i].host = std::move(bufs[(size_t)i]);
         snaps[i].state_bytes = st_bytes;
         snaps[i].conv_bytes = cv_bytes;
@@ -4693,11 +5183,16 @@ bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateS
     if (!snap.host || snap.state_bytes != st_bytes || snap.conv_bytes != cv_bytes ||
         !b.lin_state || !b.lin_conv_state)
         return false;
-    cu(cudaMemcpyAsync(b.lin_state, snap.host.get(), st_bytes, cudaMemcpyHostToDevice, s.stream),
-       "prefix-cache state restore");
-    cu(cudaMemcpyAsync(b.lin_conv_state, static_cast<char*>(snap.host.get()) + st_bytes, cv_bytes,
-                       cudaMemcpyHostToDevice, s.stream), "prefix-cache conv restore");
-    if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    {
+        // Held until the copies have run: the snapshot may be moving to pageable memory, and its
+        // pinned buffer is handed back only under this lock.
+        std::lock_guard<std::mutex> g(snap.host->mu);
+        cu(cudaMemcpyAsync(b.lin_state, snap.host->data, st_bytes, cudaMemcpyHostToDevice, s.stream),
+           "prefix-cache state restore");
+        cu(cudaMemcpyAsync(b.lin_conv_state, static_cast<char*>(snap.host->data) + st_bytes, cv_bytes,
+                           cudaMemcpyHostToDevice, s.stream), "prefix-cache conv restore");
+        if (cudaStreamSynchronize(s.stream) != cudaSuccess) return false;
+    }
     // The snapshot is the fp32 form a prefill writes, whatever this session's buffer held before.
     b.lin_state_b16 = false;
     if (s.active_seq_id == seq_id) s.active_lin_state_b16 = false;
@@ -4773,15 +5268,90 @@ int Qwen35Model::max_packed_rows() {
     return cap;
 }
 
-bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
-                                const uint64_t* seq_ids, int n, int* out_sampled,
-                                const PackedSampling* sampling) {
-    Impl& s = *p_;
-    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
-    if (n < 1 || n > kQwen35MaxPackedRows) return false;
-    if (!s.cfg.hybrid || !s.gguf) return false;
-    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+// The per-row sampler buffers decode_packed and the speculative verify share: host and device
+// copies of every row's temperature/seed/step/top_k/top_p and its drawn id.
+template <class Impl>
+static bool ensure_packed_samp(Impl& s) {
+    if (s.packed_samp_dev) return true;
+    if (cudaHostAlloc(&s.packed_samp_host, sizeof(typename Impl::PackedSampleRows), cudaHostAllocDefault)
+        != cudaSuccess) { s.packed_samp_host = nullptr; return false; }
+    if (cudaMalloc(&s.packed_samp_dev, sizeof(typename Impl::PackedSampleRows)) != cudaSuccess) {
+        s.packed_samp_dev = nullptr;
+        return false;
+    }
+    return true;
+}
 
+// Samples rows [0, n) of `logits` ([n, vocab] on the device, left as the forward wrote them or
+// masked in place) with the parameters already in s.packed_samp_host, writing each sampled row's
+// id to packed_samp_host->out; rows with temperature <= 0 are skipped. Synchronizes the stream.
+// Returns false on a CUDA error.
+//
+// forward_token's order on each row's own logits: top_k/top_p mask, temperature noise, argmax,
+// with the Philox counter at the vocab index, so a row draws the token it would alone. Rows with
+// a top_k in range are sampled together in one launch (launch_sample_rows_topk: the same
+// survivors, key and noise, without sorting the vocab once per row -- at 32 sampled rows the
+// per-row sorts were ~3 ms of an 18.7 ms step on an RTX 5090). The rest run the per-row path on
+// forward_token's scratch, one after another. SPARKINFER_BATCHED_SAMPLER=0 samples every row alone.
+template <class Impl>
+static bool sample_rows_packed(Impl& s, float* logits, int n) {
+    const int vocab = s.cfg.vocab;
+    cudaStream_t st = s.stream;
+    auto* h = s.packed_samp_host;
+    auto* d = s.packed_samp_dev;
+    cu(cudaMemcpyAsync(d, h, sizeof(*h), cudaMemcpyHostToDevice, st), "packed sample params");
+    auto sample_row_alone = [&](int i) {
+        float* row = logits + (size_t)i * vocab;
+        if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
+            kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
+                                           s.d_sorted_idx, s.d_topk_exp, s.d_topk_cumsum,
+                                           s.d_sort_temp, s.sort_temp_bytes, s.d_scan_temp,
+                                           s.scan_temp_bytes, &d->top_k[i], &d->top_p[i],
+                                           s.d_rank_by_id, st);
+        kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
+        kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
+    };
+    static const bool batched_on = [] {
+        const char* e = getenv("SPARKINFER_BATCHED_SAMPLER");
+        return !(e && e[0] == '0');
+    }();
+    bool any_batched = false;
+    for (int i = 0; i < n; i++) {
+        if (!(h->temp[i] > 0.f)) continue;
+        if (batched_on && kernels::sample_rows_topk_eligible(h->temp[i], h->top_k[i], vocab))
+            any_batched = true;
+        else
+            sample_row_alone(i);
+    }
+    if (any_batched)
+        kernels::launch_sample_rows_topk(logits, n, vocab, d->temp, d->seed, d->step,
+                                         d->top_k, d->top_p, d->out, st);
+    cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+       "packed sampled ids");
+    cudaError_t e = cudaStreamSynchronize(st);
+    cu(e, "packed sample sync");
+    if (e != cudaSuccess) return false;
+    // A batched row whose candidate set overflowed came back as -1; sample it alone. The batched
+    // kernel does not write the logits, so they are still the forward's.
+    bool redo = false;
+    for (int i = 0; i < n; i++)
+        if (h->temp[i] > 0.f && h->out[i] < 0) { sample_row_alone(i); redo = true; }
+    if (redo) {
+        cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
+           "packed sampled ids (redo)");
+        e = cudaStreamSynchronize(st);
+        cu(e, "packed sample sync (redo)");
+        if (e != cudaSuccess) return false;
+    }
+    return true;
+}
+
+// decode_packed's and mixed_step's per-row setup: each row's session buffers into the pinned
+// staging and, when the row set moved, onto the device (packed_dev_*); every row's recurrent
+// state compacted to bf16 once (see decode_packed). False -- having launched nothing that
+// changes a row's arithmetic -- when a row cannot be packed.
+template <class Impl>
+static bool packed_rows_prepare(Impl& s, const uint64_t* seq_ids, int n, bool* state_b16_out) {
     // Resolve each row's per-session buffers. A row whose session is missing (or never got its
     // hybrid state) cannot be packed -- decline the whole batch rather than silently decode it
     // against another request's state.
@@ -4805,22 +5375,6 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             != cudaSuccess) return false;
         if (cudaHostAlloc(&s.packed_host_seqs, np * sizeof(uint64_t), cudaHostAllocDefault)
             != cudaSuccess) return false;
-    }
-    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
-    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
-    bool any_sampled = false;
-    if (sampling) {
-        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
-            !sampling->top_p) return false;
-        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
-    }
-    if (any_sampled && !s.packed_samp_dev) {
-        if (cudaHostAlloc(&s.packed_samp_host, sizeof(Impl::PackedSampleRows), cudaHostAllocDefault)
-            != cudaSuccess) { s.packed_samp_host = nullptr; return false; }
-        if (cudaMalloc(&s.packed_samp_dev, sizeof(Impl::PackedSampleRows)) != cudaSuccess) {
-            s.packed_samp_dev = nullptr;
-            return false;
-        }
     }
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
@@ -4878,7 +5432,8 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         const char* e = getenv("SPARKINFER_CB_GDN_STATE_B16");
         return !(e && e[0] == '0');
     }();
-    bool packed_state_b16 = false;
+    bool& packed_state_b16 = *state_b16_out;
+    packed_state_b16 = false;
     if (kGdnStateB16 && needs_linear_state(s.cfg)) {
         const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
                             s.cfg.linear_head_dim * s.cfg.linear_head_dim;
@@ -4916,6 +5471,32 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             if (sit != s.sessions.end() && sit->second.lin_state_b16) return false;
         }
     }
+
+    return true;
+}
+
+bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
+                                const uint64_t* seq_ids, int n, int* out_sampled,
+                                const PackedSampling* sampling) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n < 1 || n > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
+    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+    bool packed_state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return false;
+    float** h_states = static_cast<float**>(s.packed_host_states);
+    void**  h_convs  = static_cast<void**>(s.packed_host_convs);
 
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
@@ -4955,10 +5536,7 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     // complete: returning false now would make the caller run the rows again. What is left is
     // kernel launches on buffers that already exist.
     if (any_sampled && packed_logits) {
-        const int vocab = s.cfg.vocab;
-        cudaStream_t st = s.stream;
         Impl::PackedSampleRows* h = s.packed_samp_host;
-        Impl::PackedSampleRows* d = s.packed_samp_dev;
         for (int i = 0; i < n; i++) {
             h->temp[i] = sampling->temperature[i];
             h->seed[i] = sampling->seed[i];
@@ -4966,28 +5544,393 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             h->top_k[i] = sampling->top_k[i];
             h->top_p[i] = sampling->top_p[i];
         }
-        cu(cudaMemcpyAsync(d, h, sizeof(Impl::PackedSampleRows), cudaMemcpyHostToDevice, st),
-           "packed sample params");
-        // forward_token's order on each row's own logits: top_k/top_p mask, temperature noise,
-        // argmax. Launched with n_rows = 1 on the row, so the Philox counter is the vocab index
-        // exactly as in forward_token, and a request draws the same token packed or alone. The
-        // mask reuses forward_token's scratch; the rows run one after another on one stream.
-        for (int i = 0; i < n; i++) {
-            if (!(h->temp[i] > 0.f)) continue;
-            float* row = packed_logits + (size_t)i * vocab;
-            if ((h->top_k[i] > 0 && h->top_k[i] < vocab) || h->top_p[i] < 1.f)
-                kernels::launch_topk_topp_mask(row, vocab, s.d_vocab_iota, s.d_sorted_logits,
-                                               s.d_sorted_idx, s.d_topk_exp, s.d_topk_cumsum,
-                                               s.d_sort_temp, s.sort_temp_bytes, s.d_scan_temp,
-                                               s.scan_temp_bytes, &d->top_k[i], &d->top_p[i],
-                                               s.d_rank_by_id, st);
-            kernels::launch_temperature_sample(row, 1, vocab, &d->temp[i], &d->seed[i], &d->step[i], st);
-            kernels::launch_argmax(row, &d->out[i], 1, vocab, st);
-        }
-        cu(cudaMemcpyAsync(h->out, d->out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost, st),
-           "packed sampled ids");
-        cu(cudaStreamSynchronize(st), "packed sample sync");
+        sample_rows_packed(s, packed_logits, n);
         for (int i = 0; i < n; i++)
+            if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
+    }
+    return true;
+}
+
+// A mixed step's scratch, allocated once: per-row tables and positions, split-KV partials, the
+// decode rows' head input, logits and the pinned host slots (mixed_step, mixed_step_multi).
+// A mixed step's FFN reads the Bonsai decode shadow's ternary legs, as a packed prompt prefill
+// does (ingest_prompts_packed) and as packed decode's rows do: without them the whole pass ran the
+// folded int8 FFN (a 1,024-row Bonsai-2 step took ~150 ms against ~80 on Qwen3.8).
+// SPARKINFER_BONSAI_PACK_SHADOW=0 keeps the folded legs, as for packs.
+template <class Impl>
+static void set_mix_shadow_legs(Impl& s, Qwen35PrefillCtx& ctx) {
+    static const bool pack_shadow = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_PACK_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (!pack_shadow || s.bonsai_dec_layers.empty() || s.bonsai_dec_rs.size() != s.bonsai_dec_layers.size())
+        return;
+    ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
+    ctx.bonsai_pf_rs = s.bonsai_dec_rs.data();
+    const auto so = s.bonsai_sign_dev.find(s.qdim);
+    if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
+}
+
+// A head a mixed step's decode rows can score (prefill_batched_run takes the same set).
+template <class Impl>
+static bool mix_head_ok(const Impl& s) {
+    const int H = s.cfg.hidden;
+    return s.w.lm_head_type == 12 ||
+           ((s.w.lm_head_type == 14 || s.w.lm_head_type == 8) && (H == 2048 || H == 4096));
+}
+
+// A dense k-quant GGUF (per-row weight scales placed for the fused int8 prefill GEMMs; not Muse,
+// not MoE, not ternary Bonsai) does not mix. Its batched prefill runs int8 projections, which put a
+// mixed step's decode rows 1.5-4 points below one forward per row (packed_decode_check, mixed mode,
+// Qwen3.8-27B-UD-Q4_K_M); bf16 projections match it but made the passes so slow that mixing lost to
+// not mixing (qwen3_gguf_cb_bench c16 400 vs 535 tok/s). Such a model keeps packed decode and
+// prefills prompts in passes of their own, as it did before it could decode packed at all.
+// SPARKINFER_MIXED_KQUANT=1 lets it mix with the int8 projections.
+template <class Impl>
+static bool mix_kquant_ok(const Impl& s) {
+    static const bool allow = [] {
+        const char* e = getenv("SPARKINFER_MIXED_KQUANT");
+        return e && e[0] == '1';
+    }();
+    if (allow || !s.cfg.dense_ffn || s.cfg.muse_glimmer || s.bonsai_block != 0) return true;
+    for (const auto& w : s.w.layers)
+        if (w.gate_rs || w.down_rs || w.wqkv_rs || w.wq_rs) return false;
+    return true;
+}
+
+template <class Impl>
+static bool ensure_mix_scratch(Impl& s) {
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
+    const int mbs = s.kv->max_blocks_per_seq();
+    if (!s.mix_btab || s.mix_btab_mbs < mbs) {
+        if (s.mix_btab) cudaFree(s.mix_btab);
+        s.mix_btab = nullptr;
+        s.mix_btab_mbs = 0;
+        if (cudaMalloc(&s.mix_btab, (size_t)kRows * mbs * sizeof(int)) != cudaSuccess) {
+            s.mix_btab = nullptr;
+            return false;
+        }
+        s.mix_btab_mbs = mbs;
+    }
+    if (!s.mix_pos_d) {
+        const size_t fa_n = (size_t)kRows * s.cfg.n_q_heads * kMixSplitsMax;
+        bool ok = cudaMalloc(&s.mix_pos_d, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_seq_d, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_d_out, kRows * sizeof(int)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_fa, fa_n * (2 + s.cfg.head_dim) * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_q81, kRows * kernels::llama_q8_1_bytes(s.cfg.hidden)) == cudaSuccess &&
+                  cudaMalloc(&s.mix_logits, (size_t)kRows * s.cfg.vocab * sizeof(float)) == cudaSuccess &&
+                  cudaHostAlloc(&s.mix_host, 3 * kRows * sizeof(int), cudaHostAllocDefault) == cudaSuccess;
+        if (!ok) {
+            for (void* p : {(void*)s.mix_pos_d, (void*)s.mix_seq_d, (void*)s.mix_d_out, (void*)s.mix_fa,
+                            s.mix_q81, (void*)s.mix_logits})
+                if (p) cudaFree(p);
+            if (s.mix_host) cudaFreeHost(s.mix_host);
+            s.mix_pos_d = s.mix_seq_d = s.mix_d_out = nullptr;
+            s.mix_fa = nullptr; s.mix_q81 = nullptr; s.mix_logits = nullptr; s.mix_host = nullptr;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool Qwen35Model::mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                             int n_dec, int* out_sampled, const PackedSampling* sampling,
+                             uint64_t chunk_seq, const int* chunk_ids, int pos0, int len,
+                             int* chunk_seed) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled || !chunk_ids || !chunk_seed) return false;
+    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows || len < 1 || pos0 < 0) return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s) || !mix_kquant_ok(s))
+        return false;
+    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
+        return false;
+    for (int i = 0; i < n_dec; ++i)
+        if (seq_ids[i] == chunk_seq || seq_ids[i] == 0) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The chunk's session: its own fp32 recurrent state (a prompt being prefilled was never
+    // compacted), no logit bias (the seed below is the raw argmax, as a pass's own is).
+    {
+        auto cit = s.sessions.find(chunk_seq);
+        if (chunk_seq == 0 || cit == s.sessions.end() || !cit->second.lin_state ||
+            !cit->second.lin_conv_state || cit->second.lin_state_b16 || cit->second.logit_bias_set)
+            return false;
+    }
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+
+    // Scratch, once (the tables grow with the pool's max blocks per sequence).
+    if (!ensure_mix_scratch(s)) return false;
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
+    // The decode rows, exactly as decode_packed resolves them.
+    bool state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n_dec, &state_b16)) return false;
+    int* h_pos = s.mix_host;
+    int* h_seq = s.mix_host + kRows;
+    int* h_out = s.mix_host + 2 * kRows;
+    int hint = 0;
+    for (int i = 0; i < n_dec; ++i) {
+        h_pos[i] = positions[i];
+        h_seq[i] = positions[i] + 1;
+        hint = std::max(hint, h_seq[i]);
+    }
+    cu(cudaMemcpyAsync(s.mix_pos_d, h_pos, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed positions");
+    cu(cudaMemcpyAsync(s.mix_seq_d, h_seq, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed lengths");
+    // Packed decode's split count for its wide steps, capped at what the scratch holds.
+    const int splits = std::max(1, std::min(n_dec >= 24 ? 16 : s.n_splits, kMixSplitsMax));
+
+    // The chunk's session is the pass's own, as it is for any prefill.
+    activate_session(chunk_seq);
+    // Same rule as prefill_batched: a pass this long needs the arena more than wide decode needs
+    // the NVFP4 head (the decode rows here read the Q4_K head).
+    static const int kHeadFp4YieldTokens = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    if (n_dec + len >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf))
+        release_lm_head_fp4();
+    auto it = s.sessions.find(chunk_seq);
+    std::vector<int> ids((size_t)n_dec + len);
+    std::copy(tokens, tokens + n_dec, ids.begin());
+    std::copy(chunk_ids, chunk_ids + len, ids.begin() + n_dec);
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, chunk_seq,
+                          it->second.lin_state, it->second.lin_conv_state,
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0,
+                          nullptr, nullptr, 0,
+                          nullptr };
+    ctx.mix_n = n_dec;
+    ctx.mix_rows = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.mix_btab = s.mix_btab;
+    ctx.mix_pos = s.mix_pos_d;
+    ctx.mix_seq = s.mix_seq_d;
+    ctx.mix_seq_hint = hint;
+    ctx.mix_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.mix_lin_conv = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    ctx.mix_state_b16 = state_b16;
+    ctx.mix_splits = splits;
+    ctx.mix_fa = s.mix_fa;
+    ctx.mix_q81 = s.mix_q81;
+    ctx.mix_logits = s.mix_logits;
+    ctx.mix_d_out = s.mix_d_out;
+    ctx.mix_out = h_out;
+    set_mix_shadow_legs(s, ctx);
+    bool scratch_oom = false;
+    ctx.scratch_oom_out = &scratch_oom;
+    const int seed = prefill_batched_run(ctx, ids.data(), n_dec + len, pos0);
+    // A pass that declines does so before its first kernel: nothing moved, the caller runs the
+    // two steps apart.
+    if (seed < 0 || seed >= s.cfg.vocab) return false;
+    *chunk_seed = seed;
+    // Batched prefill writes the chunk session's state as fp32; the decode rows keep theirs.
+    it->second.lin_state_b16 = false;
+    s.active_lin_state_b16 = false;
+    for (int i = 0; i < n_dec; ++i) out_sampled[i] = h_out[i];
+    if (any_sampled) {
+        Impl::PackedSampleRows* h = s.packed_samp_host;
+        for (int i = 0; i < n_dec; i++) {
+            h->temp[i] = sampling->temperature[i];
+            h->seed[i] = sampling->seed[i];
+            h->step[i] = sampling->step[i];
+            h->top_k[i] = sampling->top_k[i];
+            h->top_p[i] = sampling->top_p[i];
+        }
+        sample_rows_packed(s, s.mix_logits, n_dec);
+        for (int i = 0; i < n_dec; i++)
+            if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
+    }
+    return true;
+}
+
+bool Qwen35Model::mixed_step_multi(const int* tokens, const int* positions, const uint64_t* seq_ids,
+                                   int n_dec, int* out_sampled, const PackedSampling* sampling,
+                                   int n_chunks, const uint64_t* chunk_seqs,
+                                   const int* const* chunk_ids, const int* pos0s, const int* lens,
+                                   const unsigned char* want_seed, int* chunk_seeds,
+                                   const PackedSampling* chunk_sampling) {
+    if (n_chunks < 1 || !chunk_seqs || !chunk_ids || !pos0s || !lens) return false;
+    bool any_seed = false;
+    for (int c = 0; want_seed && c < n_chunks; ++c) any_seed = any_seed || want_seed[c];
+    if (any_seed && !chunk_seeds) return false;
+    if (n_chunks == 1 && !any_seed) {   // the one-chunk step, unchanged
+        int seed = -1;
+        return mixed_step(tokens, positions, seq_ids, n_dec, out_sampled, sampling, chunk_seqs[0],
+                          chunk_ids[0], pos0s[0], lens[0], &seed);
+    }
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n_dec < 1 || n_dec > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf || s.cfg.muse_glimmer || !mix_head_ok(s) || !mix_kquant_ok(s))
+        return false;
+    if (!s.kv->int8_kv() || s.kv->windowed() || s.d_vision_emb || s.d_mrope_pos || s.dflash_capture)
+        return false;
+    int total = 0;
+    for (int c = 0; c < n_chunks; ++c) {
+        if (!chunk_ids[c] || lens[c] < 1 || pos0s[c] < 0 || chunk_seqs[c] == 0) return false;
+        for (int c2 = 0; c2 < c; ++c2) if (chunk_seqs[c2] == chunk_seqs[c]) return false;
+        for (int i = 0; i < n_dec; ++i) if (seq_ids[i] == chunk_seqs[c]) return false;
+        total += lens[c];
+    }
+    for (int i = 0; i < n_dec; ++i) if (seq_ids[i] == 0) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // Each chunk's session: fp32 recurrent state (a prompt being prefilled was never compacted),
+    // no logit bias.
+    std::vector<float*> lin_state((size_t)n_chunks);
+    std::vector<void*> lin_conv((size_t)n_chunks);
+    for (int c = 0; c < n_chunks; ++c) {
+        auto cit = s.sessions.find(chunk_seqs[c]);
+        // No logit bias: a seed here is the raw argmax (or a draw from the raw logits).
+        if (cit == s.sessions.end() || !cit->second.lin_state || !cit->second.lin_conv_state ||
+            cit->second.lin_state_b16 || cit->second.logit_bias_set)
+            return false;
+        lin_state[(size_t)c] = cit->second.lin_state;
+        lin_conv[(size_t)c] = cit->second.lin_conv_state;
+    }
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n_dec && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+    if (!ensure_mix_scratch(s)) return false;
+    constexpr int kRows = kQwen35MaxPackedRows;
+    constexpr int kMixSplitsMax = 32;
+    bool state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n_dec, &state_b16)) return false;
+    int* h_pos = s.mix_host;
+    int* h_seq = s.mix_host + kRows;
+    int* h_out = s.mix_host + 2 * kRows;
+    int hint = 0;
+    for (int i = 0; i < n_dec; ++i) {
+        h_pos[i] = positions[i];
+        h_seq[i] = positions[i] + 1;
+        hint = std::max(hint, h_seq[i]);
+    }
+    cu(cudaMemcpyAsync(s.mix_pos_d, h_pos, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed positions");
+    cu(cudaMemcpyAsync(s.mix_seq_d, h_seq, n_dec * sizeof(int), cudaMemcpyHostToDevice, s.stream),
+       "mixed lengths");
+    const int splits = std::max(1, std::min(n_dec >= 24 ? 16 : s.n_splits, kMixSplitsMax));
+    // The first chunk's session is the pass's own, as a packed prefill's first prompt's is.
+    activate_session(chunk_seqs[0]);
+    static const int kHeadFp4YieldTokens = [] {
+        const char* e = getenv("SPARKINFER_Q38_HEAD_NVFP4_YIELD_TOKENS");
+        const int v = e ? atoi(e) : 1024;
+        return v < 1 ? 1 : v;
+    }();
+    if (n_dec + total >= kHeadFp4YieldTokens && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf))
+        release_lm_head_fp4();
+    std::vector<int> ids((size_t)n_dec + total);
+    std::vector<int> off((size_t)n_chunks);
+    std::copy(tokens, tokens + n_dec, ids.begin());
+    for (int c = 0, o = n_dec; c < n_chunks; o += lens[c], ++c) {
+        off[(size_t)c] = o;
+        std::copy(chunk_ids[c], chunk_ids[c] + lens[c], ids.begin() + o);
+    }
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, chunk_seqs[0],
+                          lin_state[0], lin_conv[0],
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0,
+                          nullptr, nullptr, 0,
+                          nullptr };
+    ctx.mix_n = n_dec;
+    ctx.mix_rows = reinterpret_cast<const int* const*>(s.packed_dev_tables);
+    ctx.mix_btab = s.mix_btab;
+    ctx.mix_pos = s.mix_pos_d;
+    ctx.mix_seq = s.mix_seq_d;
+    ctx.mix_seq_hint = hint;
+    ctx.mix_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
+    ctx.mix_lin_conv = reinterpret_cast<void* const*>(s.packed_dev_convs);
+    ctx.mix_state_b16 = state_b16;
+    ctx.mix_splits = splits;
+    ctx.mix_fa = s.mix_fa;
+    ctx.mix_q81 = s.mix_q81;
+    ctx.mix_logits = s.mix_logits;
+    ctx.mix_d_out = s.mix_d_out;
+    ctx.mix_out = h_out;
+    set_mix_shadow_legs(s, ctx);
+    ctx.multi_n = n_chunks;
+    ctx.multi_off = off.data();
+    ctx.multi_len = lens;
+    ctx.multi_seq_ids = chunk_seqs;
+    ctx.multi_lin_state = lin_state.data();
+    ctx.multi_lin_conv = lin_conv.data();
+    ctx.multi_pos0 = pos0s;
+    // The chunks that end their prompts take a seed, drawn as ingest_prompts_packed draws one.
+    struct SeedSampler { Impl* s; const PackedSampling* samp; };
+    SeedSampler sampler{ &s, chunk_sampling };
+    if (any_seed) {
+        for (int c = 0; c < n_chunks; ++c) chunk_seeds[c] = -1;
+        ctx.multi_seed = chunk_seeds;
+        ctx.multi_want_seed = want_seed;
+        if (chunk_sampling && chunk_sampling->temperature && chunk_sampling->seed &&
+            chunk_sampling->step && chunk_sampling->top_k && chunk_sampling->top_p) {
+            ctx.multi_sample = [](void* user, int i) -> int {
+                const SeedSampler& x = *static_cast<const SeedSampler*>(user);
+                if (!(x.samp->temperature[i] > 0.f)) return -1;
+                return sample_logits_row(*x.s, x.samp->temperature[i], x.samp->seed[i],
+                                         x.samp->step[i], x.samp->top_k[i], x.samp->top_p[i]);
+            };
+            ctx.multi_sample_user = &sampler;
+        }
+    } else {
+        ctx.multi_no_seed = true;
+    }
+    bool scratch_oom = false;
+    ctx.scratch_oom_out = &scratch_oom;
+    if (prefill_batched_run(ctx, ids.data(), n_dec + total, 0) < 0) return false;
+    // The step ran (the decode rows moved): a seed that did not come back is reported as -1, for
+    // the caller to fail that request as it fails any prefill's invalid seed.
+    for (int c = 0; any_seed && c < n_chunks; ++c)
+        if (want_seed[c] && chunk_seeds[c] >= s.cfg.vocab) chunk_seeds[c] = -1;
+    // Batched prefill writes each chunk session's state as fp32; the decode rows keep theirs.
+    for (int c = 0; c < n_chunks; ++c) {
+        auto cit = s.sessions.find(chunk_seqs[c]);
+        if (cit != s.sessions.end()) cit->second.lin_state_b16 = false;
+    }
+    s.active_lin_state_b16 = false;
+    for (int i = 0; i < n_dec; ++i) out_sampled[i] = h_out[i];
+    if (any_sampled) {
+        Impl::PackedSampleRows* h = s.packed_samp_host;
+        for (int i = 0; i < n_dec; i++) {
+            h->temp[i] = sampling->temperature[i];
+            h->seed[i] = sampling->seed[i];
+            h->step[i] = sampling->step[i];
+            h->top_k[i] = sampling->top_k[i];
+            h->top_p[i] = sampling->top_p[i];
+        }
+        sample_rows_packed(s, s.mix_logits, n_dec);
+        for (int i = 0; i < n_dec; i++)
             if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
     }
     return true;
@@ -5255,6 +6198,44 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
+bool Qwen35Model::spec_adopt_session(uint64_t seq_id) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> lock(s.device_mu);
+    auto it = s.sessions.find(seq_id);
+    if (seq_id == 0 || it == s.sessions.end()) return false;
+    if (!it->second.lin_state_b16) return true;
+    // Packed decode compacted this session's GDN state to bf16; the grouped verify reads fp32.
+    const size_t st_n = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
+                        s.cfg.linear_head_dim * s.cfg.linear_head_dim;
+    if (!s.gdn_state_stage && cudaMalloc(&s.gdn_state_stage, st_n * sizeof(bf16)) != cudaSuccess) {
+        cudaGetLastError();
+        s.gdn_state_stage = nullptr;
+        return false;
+    }
+    if (!kernels::launch_qwen36_gdn_state_from_b16(it->second.lin_state, s.gdn_state_stage, st_n, s.stream))
+        return false;
+    it->second.lin_state_b16 = false;
+    if (s.active_seq_id == seq_id) s.active_lin_state_b16 = false;
+    invalidate_decode_graph();
+    return true;
+}
+
+size_t Qwen35Model::dflash_draft_offload() {
+    if (!p_->dflash_draft) return 0;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return p_->dflash_draft->offload();
+}
+
+bool Qwen35Model::dflash_draft_restore() {
+    if (!p_->dflash_draft) return false;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return restore_draft_with_room(*p_);
+}
+
+bool Qwen35Model::dflash_draft_offloaded() const {
+    return p_->dflash_draft && p_->dflash_draft->offloaded();
+}
+
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
                                     int context_start, int context_end) {
     Impl& s = *p_;
@@ -5290,13 +6271,6 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         s.dflash_context = nullptr;
         fprintf(stderr, "[dflash] capture context (%d positions): out of device memory\n", s.dflash_ctx_cap);
     }
-    if (s.cfg.hybrid && !s.spec_lin_snap) {
-        const size_t ls = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
-                          s.cfg.linear_head_dim * s.cfg.linear_head_dim;
-        const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
-        s.spec_lin_snap = s.alloc<float>(ls);
-        s.spec_conv_snap = s.alloc<bf16>(cs);
-    }
     if (const char* e = getenv("SPARKINFER_DFLASH_CAPTURE"); e && e[0] == '1')
         fprintf(stderr, "[dflash] capture on n_cap=%d max_rows=%d\n", s.dflash_n_cap, s.dflash_max_rows);
 }
@@ -5327,9 +6301,13 @@ int Qwen35Model::dflash_context_len() const { return p_->dflash_ctx_len; }
 void Qwen35Model::save_spec_snapshot() {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
-    if (!s.spec_lin_snap || !c.hybrid) return;
+    if (!c.hybrid) return;
     const size_t ls = (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    // Allocated here, on first use, rather than with every capture: no serving path snapshots,
+    // and 155 MB held for nothing beside a loaded draft is part of what concurrent serving lacks.
+    if (!s.spec_lin_snap) s.spec_lin_snap = s.alloc<float>(ls);
+    if (!s.spec_conv_snap) s.spec_conv_snap = s.alloc<bf16>(cs);
     cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
        "spec snap lin");
     cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
@@ -5386,6 +6364,531 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
                             s.dflash_hidden, argmax.data(), /*capture_only=*/true);
 }
 
+bool Qwen35Model::verify_grouped(int n_groups, const uint64_t* seq_ids, const int* const* tokens,
+                                 const int* lens, const int* start_pos, const PackedSampling* sampling,
+                                 int* out_ids, int* keep, const void* capture_dst, const bool* commit_all) {
+    Impl& s = *p_;
+    if (n_groups < 1 || n_groups > 8 || !seq_ids || !tokens || !lens || !start_pos || !out_ids || !keep)
+        return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    constexpr int kRows = kQwen35MaxPackedRows;
+    int N = 0;
+    for (int g = 0; g < n_groups; ++g) {
+        if (lens[g] < 1) return false;
+        N += lens[g];
+    }
+    if (N > kRows) return false;
+    std::vector<float*> g_state((size_t)n_groups);
+    std::vector<void*> g_conv((size_t)n_groups);
+    std::vector<int> g_off((size_t)n_groups), g_keep((size_t)n_groups, 0);
+    if (!s.grp_dev_tables) {
+        if (cudaMalloc(&s.grp_dev_tables, kRows * sizeof(int*)) != cudaSuccess ||
+            cudaMalloc(&s.grp_dev_tables_win, kRows * sizeof(int*)) != cudaSuccess ||
+            cudaHostAlloc(&s.grp_host_tables, 2 * kRows * sizeof(int*), cudaHostAllocDefault) != cudaSuccess)
+            return false;
+    }
+    const int** h_tab = s.grp_host_tables;
+    const int** h_win = s.grp_host_tables + kRows;
+    std::vector<int> ids((size_t)N), pos((size_t)N);
+    for (int g = 0, r = 0; g < n_groups; ++g) {
+        auto it = s.sessions.find(seq_ids[g]);
+        if (seq_ids[g] == 0 || it == s.sessions.end() || !it->second.lin_state ||
+            !it->second.lin_conv_state || it->second.lin_state_b16)
+            return false;
+        const int* tbl = s.kv->block_table(seq_ids[g]);
+        const int* win = s.kv->block_table_win(seq_ids[g]);
+        if (!tbl || !win) return false;
+        g_state[(size_t)g] = it->second.lin_state;
+        g_conv[(size_t)g] = it->second.lin_conv_state;
+        g_off[(size_t)g] = r;
+        for (int i = 0; i < lens[g]; ++i, ++r) {
+            ids[(size_t)r] = tokens[g][i];
+            pos[(size_t)r] = start_pos[g] + i;
+            h_tab[r] = tbl;
+            h_win[r] = win;
+        }
+    }
+    cu(cudaMemcpyAsync(s.grp_dev_tables, h_tab, (size_t)N * sizeof(int*), cudaMemcpyHostToDevice, s.stream),
+       "grouped tables");
+    cu(cudaMemcpyAsync(s.grp_dev_tables_win, h_win, (size_t)N * sizeof(int*), cudaMemcpyHostToDevice, s.stream),
+       "grouped ring tables");
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
+                          g_state[0], g_conv[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    ctx.packed_pos = pos.data();
+    ctx.packed_rows = reinterpret_cast<const int* const*>(s.grp_dev_tables);
+    ctx.packed_rows_win = reinterpret_cast<const int* const*>(s.grp_dev_tables_win);
+    ctx.group_n = n_groups;
+    ctx.group_off = g_off.data();
+    ctx.group_len = lens;
+    ctx.group_lin_state = g_state.data();
+    ctx.group_lin_conv = g_conv.data();
+    ctx.group_keep = g_keep.data();
+    ctx.group_commit_all = commit_all;
+    ctx.verify_eager = true;
+    // Each row drawn with its group's sampler at that row's own step, as the one-sequence verify
+    // draws its rows (see batched_forward), through the packed rows' sampler.
+    struct GroupSampler {
+        Impl* m;
+        const PackedSampling* samp;
+        const int* lens;
+        int n_groups;
+    } gs{&s, sampling, lens, n_groups};
+    bool any_sampled = false;
+    if (sampling)
+        for (int g = 0; g < n_groups; ++g) any_sampled = any_sampled || sampling->temperature[g] > 0.f;
+    if (any_sampled) {
+        if (!ensure_packed_samp(s)) return false;
+        ctx.verify_sample = [](void* user, float* logits, int n_rows, int* out) -> bool {
+            const GroupSampler& G = *static_cast<const GroupSampler*>(user);
+            Impl& m = *G.m;
+            auto* h = m.packed_samp_host;
+            for (int g = 0, r = 0; g < G.n_groups; ++g)
+                for (int i = 0; i < G.lens[g]; ++i, ++r) {
+                    h->temp[r] = G.samp->temperature[g];
+                    h->seed[r] = G.samp->seed[g];
+                    h->step[r] = G.samp->step[g] + (unsigned long long)i;
+                    h->top_k[r] = G.samp->top_k[g];
+                    h->top_p[r] = G.samp->top_p[g];
+                }
+            if (!sample_rows_packed(m, logits, n_rows)) return false;
+            for (int r = 0; r < n_rows; ++r)
+                if (h->temp[r] > 0.f) out[r] = h->out[r];
+            return true;
+        };
+        ctx.verify_sample_user = &gs;
+    }
+    const int consumed = dflash_verify_short_run(ctx, ids.data(), N, pos[0],
+                                                  s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
+                                                  s.dflash_capture ? s.dflash_n_cap : 0,
+                                                  const_cast<void*>(capture_dst), out_ids);
+    if (consumed != N) return false;
+    for (int g = 0; g < n_groups; ++g) keep[g] = g_keep[(size_t)g];
+    return true;
+}
+
+void Qwen35Model::bind_draft_shared_weights() {
+    Impl& s = *p_;
+    if (!s.dflash_draft) return;
+    // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
+    // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
+    // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
+    // With a multi-row Q4_K MMVQ the draft prefers the smaller one. SPARKINFER_DFLASH_HEAD_Q4=0
+    // restores the Q6_K copy (A/B).
+    static const int head_q4 = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_Q4");
+                                   return (e && e[0] == '0') ? 0 : 1; }();
+    const bool use_q4_head = head_q4 && lm_head_quant_type() == 12 && lm_head_weights();
+    const void* draft_head = use_q4_head ? lm_head_weights()
+                           : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
+    const int draft_head_type = use_q4_head ? lm_head_quant_type()
+                              : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
+    s.dflash_draft->set_shared_weights(embed_weights(), draft_head, draft_head_type,
+                             s.cfg.vocab, s.cfg.hidden);
+}
+
+bool Qwen35Model::spec_group_begin() {
+    Impl& s = *p_;
+    if (!s.dflash_draft) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The worker restored the draft before deciding to speculate, but a session opened on another
+    // thread may have offloaded it again since (offload_idle_draft). Bring it back or decline, and
+    // pin it for the group: nothing may take it off the device while a member can read it.
+    if (!restore_draft_with_room(s)) return false;
+    s.dflash_draft->pin(true);
+    bind_draft_shared_weights();
+    s.dflash_draft->ensure_quant();
+    return true;
+}
+
+void Qwen35Model::spec_group_end() {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    s.vsamp.on = false;
+    dflash_release_verify_cache();
+    set_dflash_capture(false, {}, 0);
+    if (s.dflash_draft) {
+        s.dflash_draft->use_slot(0);
+        for (int i = 1; i < 8; ++i) s.dflash_draft->free_slot(i);
+        s.dflash_draft->pin(false);
+    }
+    // Capture-on graphs may not be replayed by the decode that takes over.
+    invalidate_decode_graph();
+}
+
+int Qwen35Model::spec_group_depth() const {
+    const Impl& s = *p_;
+    if (!s.dflash_draft) return 0;
+    const DFlashDraftConfig& dc = s.dflash_draft->config();
+    const int B = dc.dflash2 ? dc.block_size - 1 : dc.block_size;
+    return std::max(1, std::min(B, 7));
+}
+
+// The furthest committed position a group member can speculate from: its draft writes and its
+// verify captures reach two blocks past it, inside the draft's context (SPARKINFER_DSPARK_MAX_CTX).
+// A member past this hands off (run_spec_group); it no longer bars the request from speculating.
+int Qwen35Model::spec_group_reach() const {
+    const Impl& s = *p_;
+    if (!s.dflash_draft) return -1;
+    return s.dflash_draft->config().max_seq - 2 * (spec_group_depth() + 1);
+}
+
+// Room for a whole join, checked before anything is touched, so a decline is like "draft slot": the
+// ordinary path prefills the request. Without it a long join started on a device that a busy
+// stretch had filled got its slot and capture, then no arena for its pass, and a checkpointed or
+// resumed prompt -- which cannot decline mid-way -- ran the token loop: ~80 s for 8K tokens with
+// every other request waiting (AIPerf 8K prompts at c16, 0.37x). The pass's arena is ~128 KB a row
+// (1,035 MB at 8,240) up to the 16K window; the capture, the slot and the verify arenas are sized as
+// the join allocates them. Both joins use it (spec_group_join, spec_group_join_body).
+// SPARKINFER_SPEC_JOIN_ROOM=0 skips it.
+template <class Impl>
+static bool join_has_room(Impl& s, DFlashDraftModel& draft, int n, int prefill_from, int reach, int depth) {
+    static const bool room_check = [] {
+        const char* e = getenv("SPARKINFER_SPEC_JOIN_ROOM");
+        return !(e && e[0] == '0');
+    }();
+    if (!room_check) return true;
+    const DFlashDraftConfig& dc = draft.config();
+    const size_t rows = (size_t)(n - prefill_from);
+    const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
+    const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
+    const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + depth + 1) - cap_from);
+    const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
+    const size_t slot_bytes = (size_t)draft.slot_rows(reach + 2 * (depth + 1)) *
+        (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
+    const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
+    // The capture buffer this join replaces is freed before the new one is allocated.
+    const size_t reused = s.dflash_context
+        ? (size_t)s.dflash_ctx_cap * s.dflash_n_cap * s.cfg.hidden * sizeof(bf16) : 0;
+    size_t fb = 0, tb = 0;
+    return !(cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+             fb + reused < arena + capture + slot_bytes + verify + margin);
+}
+
+int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, int slot,
+                                 const SpecHooks& hooks, SpecResume* resume, int* proposals) {
+    Impl& s = *p_;
+    static const bool trace = [] {
+        const char* e = getenv("SPARKINFER_SPEC_GROUP_TRACE");
+        return e && e[0] == '1';
+    }();
+    auto fail = [&](const char* why) {
+        if (trace) fprintf(stderr, "[spec-group] join declined: %s\n", why);
+        return -1;
+    };
+    if (!s.dflash_draft || prompt.empty() || !proposals) return fail("no draft");
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int depth = spec_group_depth();
+    const int n = (int)prompt.size();
+    const int prefill_from = std::max(0, hooks.prefill_start);
+    // Speculate as far as the draft's context reaches, then hand off (run_spec_group). Requiring
+    // prompt + max_tokens to fit it barred every request that left max_tokens to the server's cap
+    // (16,384 in the release container, the draft's whole context): the OpenAI SDK's default.
+    const int reach = (int)std::min<long>((long)n + max_new, (long)spec_group_reach());
+    if (prefill_from >= n || reach < n + 64) return fail("too long");
+    std::unique_lock<std::recursive_mutex> device_lock(s.device_mu);
+    const auto t_join0 = std::chrono::steady_clock::now();
+    auto ms_at = [&] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join0).count();
+    };
+    double t_setup = 0, t_prefill = 0, t_seed = 0;
+    // Room for the whole join, before anything is touched (join_has_room).
+    if (!join_has_room(s, draft, n, prefill_from, reach, depth)) return fail("no room for the join");
+    // The slot holds what this request can reach (the bound checked above), not the draft's whole
+    // context -- and for DFlash2, whose layers all attend a 2,048-token window, at most ~4K rows that
+    // slide (DFlashDraftModel::slot_rows): ~130 MB rather than ~0.5 GB for a request that can reach 16K.
+    if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return fail("draft slot");
+    int capture_start = std::max(0, n >= 12288 ? n - 4096 : 0);
+    capture_start = std::max(capture_start, prefill_from);
+    // Hidden rows for a verify of every member's block (kQwen35MaxPackedRows), and this prompt's
+    // context rows for its first draft block.
+    set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
+                       std::min(s.cfg.max_seq, n + depth + 1));   // prompt rows: verifies capture to the hidden buffer
+    if (!dflash_context_buffer() || !dflash_hidden_buffer()) return fail("capture buffers");
+    const uint64_t sid = hooks.seq_id;
+    invalidate_decode_graph();
+    if (!s.kv->allocate(sid, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))
+        return fail("kv allocate");
+    activate_session(sid);
+    s.final_seqlen_hint = -1;
+    if (trace) { cudaDeviceSynchronize(); t_setup = ms_at(); }
+    // The same prefill dflash_generate runs (see there): batched from zero or resumed past it, the
+    // token loop for what a pass leaves, and the caller's checkpoints one pass or per segment.
+    auto prefill_range = [&](int a, int b, bool may_decline = false) -> int {
+        int r = -1, done = a;
+        if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
+            int d = 0;
+            r = prefill_batched_chunked(prompt.data(), b, false, &d);
+            done = d;
+        } else if (a > 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b - a, s.kv)) {
+            int d = 0;
+            r = prefill_batched_resume(prompt.data(), a, b, false, &d);
+            done = a + d;
+        }
+        // The token loop below is ~10 ms a token: 83 s for an 8K prompt whose batched pass found
+        // no room (measured, joining a group beside four other 8K members). A join is optional:
+        // declined with nothing written, the request prefills on the ordinary path, as after the
+        // declines above. So for a whole prompt that the pass left untouched, past a few hundred
+        // tokens, decline rather than hold every member for a minute. Not for a segment of a
+        // checkpointed prompt (the next segment assumes this one ran) or a resumed one (its
+        // failure aborts the request).
+        if (r < 0 && may_decline && done == a && b - a > 256) return -1;
+        if (r < 0)
+            for (int i = done; i < b; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == b);
+                const int t = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) r = t;
+            }
+        return r;
+    };
+    int next = -1;
+    bool ckpts_taken = false;
+    if (hooks.n_ckpts > 0 && hooks.ckpts && hooks.snaps) {
+        int done = prefill_from;
+        next = ingest_prompt_checkpointed(prompt.data(), prefill_from, n, hooks.ckpts, hooks.n_ckpts,
+                                          hooks.snaps, &done, false);
+        if (next >= 0 && done == n) {
+            ckpts_taken = true;
+        } else {
+            int pos = prefill_from;
+            ckpts_taken = true;
+            for (int i = 0; i < hooks.n_ckpts; ++i) {
+                const int ck = hooks.ckpts[i];
+                if (prefill_range(pos, ck) < 0 || !snapshot_recurrent_state(sid, hooks.snaps[i]))
+                    ckpts_taken = false;
+                pos = ck;
+            }
+            next = prefill_range(pos, n);
+        }
+    } else {
+        next = prefill_range(prefill_from, n, /*may_decline=*/prefill_from == 0);
+    }
+    if (trace) t_prefill = ms_at();
+    if (next >= 0 && next < s.cfg.vocab && hooks.temperature > 0.f)
+        next = sample_seed_token(hooks.temperature, hooks.seed, 0, hooks.top_k, hooks.top_p);
+    if (next < 0 || next >= s.cfg.vocab) {
+        if (resume && prefill_from > 0) resume->failed = true;
+        return fail("prefill");
+    }
+    if (resume) {
+        // Prefilled: from here a failure still leaves the prompt consistent, and the caller
+        // decodes it from `position` with `next_token` instead of prefilling it again.
+        resume->engaged = true;
+        resume->position = n;
+        resume->next_token = next;
+        resume->ckpts_taken = ckpts_taken;
+    }
+    // The seed is final: hand it over before the draft reads the prompt's context. A caller that
+    // stops here (EOS, its limit) needs no draft block.
+    if (trace) t_seed = ms_at();
+    // Not under the device lock: the caller may finish the request here, which takes the engine's
+    // lock, and admission takes that one before this (dflash_generate releases it the same way).
+    if (hooks.on_tokens) {
+        device_lock.unlock();
+        const bool go = hooks.on_tokens(&next, 1);
+        device_lock.lock();
+        if (!go) {
+            if (resume) resume->finished = true;
+            return next;
+        }
+    }
+    // The first draft block, over the prompt's captured context.
+    std::vector<int> block((size_t)depth + 1, dc.mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = next;
+    draft.reset();
+    draft.set_sampling(hooks.temperature, hooks.seed, 1ull, hooks.top_k, hooks.top_p);
+    if (!draft.forward_block(dflash_context_buffer(), n, block.data(), n, ids.data(), nullptr, depth,
+                             nullptr, s.dflash_ctx_start))
+        return fail("first draft block");
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    if (trace)
+        fprintf(stderr, "[spec-group] join %d tokens: setup %.1f, prefill %.1f, seed %.1f, draft %.1f ms\n", n,
+                t_setup, t_prefill - t_setup, t_seed - t_prefill, ms_at() - t_seed);
+    return next;
+}
+
+int Qwen35Model::spec_group_join_body(const std::vector<int>& prompt, int max_new, int slot,
+                                      const SpecHooks& hooks, int* body) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || prompt.empty() || !body) return -1;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const DFlashDraftConfig& dc = draft.config();
+    const int depth = spec_group_depth();
+    const int n = (int)prompt.size();
+    const int b = n & ~7;
+    // Only a fresh prompt (no cached prefix, no checkpoints to take) with a partial last group of
+    // eight and a body the batched prefill takes in one aligned pass.
+    const int reach = (int)std::min<long>((long)n + max_new, (long)spec_group_reach());   // see spec_group_join
+    if (hooks.prefill_start != 0 || hooks.n_ckpts > 0 || b < 8 || b == n || reach < n + 64 ||
+        !batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv))
+        return -1;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The same room test as spec_group_join: this is the path a first joiner beside adopted members
+    // takes, so it runs exactly when the device is busiest. Declined, the caller tries spec_group_join.
+    if (!join_has_room(s, draft, n, 0, reach, depth)) return -1;
+    if (!draft.use_slot(slot, reach + 2 * (depth + 1))) return -1;
+    const int capture_start = n >= 12288 ? n - 4096 : 0;
+    set_dflash_capture(true, dc.target_layer_ids, kQwen35MaxPackedRows, capture_start,
+                       std::min(s.cfg.max_seq, n + depth + 1));   // prompt rows: verifies capture to the hidden buffer
+    if (!dflash_context_buffer() || !dflash_hidden_buffer()) return -1;
+    invalidate_decode_graph();
+    if (!s.kv->allocate(hooks.seq_id, session_token_budget(prompt.size(), max_new + depth + 1, s.cfg.max_seq)))
+        return -1;
+    activate_session(hooks.seq_id);
+    s.final_seqlen_hint = -1;
+    int done = 0;
+    const int r = prefill_batched_chunked(prompt.data(), b, false, &done);
+    if (r < 0 && done == 0) return -1;   // nothing landed
+    // A pass that landed part of the body: the rest token by token, as spec_group_join does.
+    for (int i = (r < 0 ? done : b); i < b; ++i) {
+        set_dflash_capture_row(0);
+        forward_token(prompt[(size_t)i], i, false);
+        dflash_stash_capture(i);
+    }
+    *body = b;
+    return 0;
+}
+
+bool Qwen35Model::spec_group_join_finish(int slot, int n, int tail_len, const void* tail_hidden, int seed,
+                                         float temperature, unsigned long long seed_rng, int top_k,
+                                         float top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || !proposals || !tail_hidden || tail_len < 1) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    const size_t row = (size_t)s.dflash_n_cap * s.cfg.hidden;
+    const int at = n - tail_len - s.dflash_ctx_start;
+    if (!s.dflash_context || at < 0 || n - s.dflash_ctx_start > s.dflash_ctx_cap) return false;
+    // The tail's captured rows, from the verify that ingested them, join the body's in the context.
+    if (cudaMemcpyAsync(s.dflash_context + (size_t)at * row, tail_hidden, (size_t)tail_len * row * sizeof(bf16),
+                        cudaMemcpyDeviceToDevice, s.stream) != cudaSuccess ||
+        cudaStreamSynchronize(s.stream) != cudaSuccess)
+        return false;
+    if (!draft.use_slot(slot)) return false;
+    std::vector<int> block((size_t)depth + 1, draft.config().mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = seed;
+    draft.reset();
+    draft.set_sampling(temperature, seed_rng, 1ull, top_k, top_p);
+    if (!draft.forward_block(dflash_context_buffer(), n, block.data(), n, ids.data(), nullptr, depth, nullptr,
+                             s.dflash_ctx_start))
+        return false;
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    return true;
+}
+
+bool Qwen35Model::spec_group_draft(int slot, const void* target_hidden, int th_len, int seed, int pos,
+                                   float temperature, unsigned long long seed_rng,
+                                   unsigned long long step0, int top_k, float top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || !proposals) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (!draft.use_slot(slot)) return false;
+    std::vector<int> block((size_t)depth + 1, draft.config().mask_token_id), ids((size_t)depth + 2, -1);
+    block[0] = seed;
+    draft.set_sampling(temperature, seed_rng, step0, top_k, top_p);
+    if (!draft.forward_block(target_hidden, th_len, block.data(), pos, ids.data(), nullptr, depth,
+                             nullptr, 0))
+        return false;
+    for (int i = 0; i < depth; ++i) proposals[i] = ids[(size_t)i + 1];
+    return true;
+}
+
+bool Qwen35Model::spec_group_draft_multi(int n, const int* slots, const void* const* hidden,
+                                         const int* th_len, const int* seeds, const int* pos,
+                                         const float* temperature, const unsigned long long* seed_rng,
+                                         const unsigned long long* step0, const int* top_k,
+                                         const float* top_p, int* proposals) {
+    Impl& s = *p_;
+    if (!s.dflash_draft || n < 2 || !proposals) return false;
+    DFlashDraftModel& draft = *s.dflash_draft;
+    const int depth = spec_group_depth();
+    const int B = draft.config().block_size;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    std::vector<int> ids((size_t)n * B, draft.config().mask_token_id), out((size_t)n * (depth + 1), -1);
+    std::vector<DFlashDraftModel::BlockJob> jobs((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        DFlashDraftModel::BlockJob& j = jobs[(size_t)i];
+        ids[(size_t)i * B] = seeds[i];
+        j.slot = slots[i];
+        j.target_hidden = hidden[i];
+        j.ctx_len = th_len[i];
+        j.noise_ids = ids.data() + (size_t)i * B;
+        j.pos0 = pos[i];
+        j.temperature = temperature[i];
+        j.seed = seed_rng[i];
+        j.step0 = step0[i];
+        j.top_k = top_k[i];
+        j.top_p = top_p[i];
+        j.out_argmax = out.data() + (size_t)i * (depth + 1);
+    }
+    // The target's NVFP4 head scores every slot's rows in one GEMM when it is resident.
+    if (!draft.forward_blocks(jobs.data(), n, depth, s.w.lm_head_fp4, s.w.lm_head_fp4_sf,
+                              s.w.lm_head_fp4_alpha))
+        return false;
+    for (int i = 0; i < n; ++i)
+        for (int t = 0; t < depth; ++t) proposals[(size_t)i * depth + t] = out[(size_t)i * (depth + 1) + t + 1];
+    return true;
+}
+
+bool Qwen35Model::spec_group_verify(int n, const uint64_t* seq_ids, const int* const* blocks,
+                                    int* lens, const int* start_pos,
+                                    const PackedSampling* sampling, int* out_ids, int* keep,
+                                    const bool* commit_all) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    if (n == 1 && !(commit_all && commit_all[0])) {
+        // One member: the single-sequence verify, which is lossless against ordinary decode as
+        // dflash_generate's is. That takes the KV split count ordinary decode uses at each row's
+        // position (adaptive_nsplits_for(p + 1)); a different count flips argmax near-ties on long
+        // contexts. So the count is set for the first row, and the block is cut where a row would
+        // reach the next tier -- the next step starts in that tier.
+        activate_session(seq_ids[0]);
+        int len = lens[0];
+        if (s.adaptive_splits) {
+            const int want = adaptive_nsplits_for(start_pos[0] + 1);
+            while (len > 1 && adaptive_nsplits_for(start_pos[0] + len) != want) --len;
+            if (want != s.n_splits) {
+                s.n_splits = want;
+                invalidate_decode_graph();
+            }
+        }
+        const bool sampled = sampling && sampling->temperature[0] > 0.f;
+        s.vsamp.on = sampled;
+        if (sampled) {
+            s.vsamp.temp = sampling->temperature[0];
+            s.vsamp.seed = sampling->seed[0];
+            s.vsamp.top_k = sampling->top_k[0];
+            s.vsamp.top_p = sampling->top_p[0];
+            s.vsamp.step0 = sampling->step[0];
+        }
+        const bool ok = batched_forward(blocks[0], len, start_pos[0], false, out_ids,
+                                        dflash_hidden_buffer());
+        s.vsamp.on = false;
+        if (!ok) return false;
+        int k = 1;
+        while (k < len && blocks[0][k] == out_ids[k - 1]) ++k;
+        keep[0] = k;
+        lens[0] = len;   // what was verified, for the caller's bookkeeping
+        return true;
+    }
+    return verify_grouped(n, seq_ids, blocks, lens, start_pos, sampling, out_ids, keep,
+                          dflash_hidden_buffer(), commit_all);
+}
+
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
                                   int* out_argmax, const void* dflash_capture_dst) {
     Impl& s = *p_;
@@ -5404,17 +6907,100 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
+    if (s.vsamp.on) {
+        // Draw each verify row's token with the request's sampler at that token's own step, so
+        // the accept rule (a proposal is kept while it equals the row before's token) compares
+        // against exactly what ordinary sampled decode would emit there.
+        ctx.verify_sample = [](void* user, float* logits, int n_rows, int* out_ids) -> bool {
+            Impl& m = *static_cast<Impl*>(user);
+            if (n_rows < 1 || n_rows > kQwen35MaxPackedRows || !ensure_packed_samp(m)) return false;
+            auto* h = m.packed_samp_host;
+            for (int i = 0; i < n_rows; i++) {
+                h->temp[i] = m.vsamp.temp;
+                h->seed[i] = m.vsamp.seed;
+                h->step[i] = m.vsamp.step0 + (unsigned long long)i;
+                h->top_k[i] = m.vsamp.top_k;
+                h->top_p[i] = m.vsamp.top_p;
+            }
+            if (!sample_rows_packed(m, logits, n_rows)) return false;
+            for (int i = 0; i < n_rows; i++) out_ids[i] = h->out[i];
+            return true;
+        };
+        ctx.verify_sample_user = &s;
+    }
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
                                                   const_cast<void*>(dflash_capture_dst), out_argmax);
     return consumed > 0;
 }
 
+// The 1-7 tokens a prompt's aligned prefill leaves over (see prefill_batched), ingested in ONE
+// forward of the verify path instead of one decode step each. The verify path is the one greedy
+// speculation relies on to reproduce decode exactly, so its KV, recurrent state and last-row
+// logits are the ones the decode steps would have produced -- at about one weight read where n
+// steps cost n. It runs eagerly, outside the verify graph cache, so it never evicts the packed
+// decode's graphs, and it commits every row. Leaves the last row's logits in s.logits, as a
+// decode step does, and returns its argmax, or -1 if the path declined (nothing committed; the
+// caller runs the decode steps). Not for a session with a logit bias or a seed that needs its
+// logprob: those are applied on forward_token's tail. SPARKINFER_PREFILL_TAIL_VERIFY=0 disables.
+int Qwen35Model::ingest_tail_rows(const int* token_ids, int n, int pos0) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TAIL_VERIFY");
+        return !(e && e[0] == '0');
+    }();
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!on || !token_ids || n < 1 || n > 32 || s.d_vision_emb || s.d_mrope_pos)
+        return -1;
+    // A speculative prefill captures the target's hidden states for the draft: the rows go straight
+    // into the context buffer at their positions (the verify capture writes the same row layout).
+    const bool cap = s.dflash_capture;
+    if (cap && (!s.dflash_context || s.dflash_n_cap <= 0 || pos0 < s.dflash_ctx_start ||
+                pos0 + n - s.dflash_ctx_start > s.dflash_ctx_cap))
+        return -1;
+    auto it = s.sessions.find(s.active_seq_id);
+    if (s.active_seq_id == 0 || it == s.sessions.end() || it->second.logit_bias_set ||
+        it->second.lin_state_b16)
+        return -1;
+    float* lin_state = it->second.lin_state;
+    bf16* lin_conv = it->second.lin_conv_state;
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
+                          lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    float* rows_logits = nullptr;
+    ctx.verify_eager = true;
+    ctx.verify_commit_all = true;
+    ctx.verify_logits_out = &rows_logits;
+    std::vector<int> out((size_t)n, -1);
+    void* cap_dst = cap ? static_cast<void*>(s.dflash_context + (size_t)(pos0 - s.dflash_ctx_start) *
+                                                                  s.dflash_n_cap * s.cfg.hidden)
+                        : nullptr;
+    const int consumed = dflash_verify_short_run(ctx, token_ids, n, pos0,
+                                                  cap ? s.dflash_layer_ids.data() : nullptr,
+                                                  cap ? s.dflash_n_cap : 0, cap_dst, out.data());
+    if (consumed == n && cap) s.dflash_ctx_len = std::max(s.dflash_ctx_len, pos0 + n);
+    if (consumed != n || !rows_logits) return consumed == n ? out[(size_t)n - 1] : -1;
+    cu(cudaMemcpyAsync(s.logits, rows_logits + (size_t)(n - 1) * s.cfg.vocab,
+                       (size_t)s.cfg.vocab * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
+       "tail rows logits");
+    cu(cudaStreamSynchronize(s.stream), "tail rows sync");
+    return out[(size_t)n - 1];
+}
+
 std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, int max_new,
                                               DFlashStats* stats, ThermalGovernor* gov,
                                               const SpecHooks* hooks, SpecResume* resume) {
     Impl& s = *p_;
-    const bool ignore_eos = [] {
+    const bool ignore_eos = (hooks && hooks->ignore_eos) || [] {
         const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
         return e && e[0] == '1';
     }();
@@ -5422,8 +7008,22 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (resume) *resume = SpecResume{};
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
+    // On the device and pinned for the whole generation, as spec_group_begin does for a group:
+    // an empty result sends the request down the ordinary path.
+    {
+        std::lock_guard<std::recursive_mutex> dl(s.device_mu);
+        if (!restore_draft_with_room(s)) return out;
+        draft.pin(true);
+    }
+    struct Unpin {
+        DFlashDraftModel& d;
+        std::recursive_mutex& m;
+        ~Unpin() { std::lock_guard<std::recursive_mutex> l(m); d.pin(false); }
+    } unpin{draft, s.device_mu};
     const DFlashDraftConfig& dc = draft.config();
-    const int B = dc.block_size;
+    // The most proposals a block carries: DFlash2 reads them from rows 1..block_size-1 (row 0 is
+    // the anchor), DSpark's row-shifted mapping from all block_size rows.
+    const int B = dc.dflash2 ? dc.block_size - 1 : dc.block_size;
     const int mask_id = dc.mask_token_id;
 
     // The sequence length below which this path keeps the original short-context behaviour: the
@@ -5549,20 +7149,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         return out;
     }
 
-    // Head for the draft. The dual-head path keeps a native Q6_K copy so the draft's multi-row
-    // MMVQ has something to chew on, but that kernel runs near HBM peak, so its runtime is just
-    // its weight bytes -- and the target's own Q4_K copy is ~280 MB against the Q6_K's ~417 MB.
-    // With a multi-row Q4_K MMVQ the draft prefers the smaller one. SPARKINFER_DFLASH_HEAD_Q4=0
-    // restores the Q6_K copy (A/B).
-    static const int head_q4 = []{ const char* e = getenv("SPARKINFER_DFLASH_HEAD_Q4");
-                                   return (e && e[0] == '0') ? 0 : 1; }();
-    const bool use_q4_head = head_q4 && lm_head_quant_type() == 12 && lm_head_weights();
-    const void* draft_head = use_q4_head ? lm_head_weights()
-                           : (s.dflash_lm_head ? s.dflash_lm_head : lm_head_weights());
-    const int draft_head_type = use_q4_head ? lm_head_quant_type()
-                              : (s.dflash_lm_head ? s.dflash_lm_head_type : lm_head_quant_type());
-    draft.set_shared_weights(embed_weights(), draft_head, draft_head_type,
-                             s.cfg.vocab, s.cfg.hidden);
+    bind_draft_shared_weights();
     // Build the draft's quantized weights here, before prefill and well before the decode clock,
     // so this generation pays exactly what it did when load() built them eagerly. The point of
     // deferring them is the branch above: a generation that takes the autoregressive path returns
@@ -5582,6 +7169,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     } else if ((int)prompt.size() >= 12288) {
         capture_start = (int)prompt.size() - 4096;
     }
+    // A prefix-cache hit prefills from hooks->prefill_start: nothing before it passes through the
+    // target, so there is nothing to capture there, and the draft reads context from here on.
+    const int prefill_from = hooks ? std::max(0, hooks->prefill_start) : 0;
+    if (prefill_from >= (int)prompt.size()) return out;
+    capture_start = std::max(capture_start, prefill_from);
     if (hooks) {
         // Past its max_seq the draft's forward_block fails mid-generation, so do not start what
         // cannot finish. The bound is on ABSOLUTE positions, the whole prompt plus everything
@@ -5644,24 +7236,87 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     s.final_seqlen_hint = hooks ? -1 : n + max_new;
     auto t0 = std::chrono::steady_clock::now();
     int next = -1;
-    int batched_done = 0;
-    if (batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv))
-        next = prefill_batched_chunked(prompt.data(), n, false, &batched_done);
-    if (next < 0) {
-        for (int i = batched_done; i < n; i++) {
-            set_dflash_capture_row(0);
-            const bool sample = (i + 1 == n);
-            int r = forward_token(prompt[i], i, sample);
-            dflash_stash_capture(i);
-            if (sample) next = r;
+    bool ckpts_taken = false;
+    // Prefill [a, b) with hidden-state capture, continuing whatever KV and state are in place at
+    // `a`: the batched pass from zero or a resumed one past it, then the token loop for anything a
+    // pass left over. Returns the last position's argmax. The same passes ingest_prompt_range runs
+    // for an ordinary request's range, so the two land on the same numbers.
+    auto prefill_range = [&](int a, int b) -> int {
+        int r = -1;
+        int done = a;
+        if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
+            int d = 0;
+            r = prefill_batched_chunked(prompt.data(), b, false, &d);
+            done = d;
+        } else if (a > 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b - a, s.kv)) {
+            int d = 0;
+            r = prefill_batched_resume(prompt.data(), a, b, false, &d);
+            done = a + d;
         }
+        if (r < 0) {
+            for (int i = done; i < b; i++) {
+                set_dflash_capture_row(0);
+                const bool sample = (i + 1 == b);
+                const int t = forward_token(prompt[i], i, sample);
+                dflash_stash_capture(i);
+                if (sample) r = t;
+            }
+        }
+        return r;
+    };
+    if (hooks && hooks->n_ckpts > 0 && hooks->ckpts && hooks->snaps) {
+        // The caller's prefix-cache checkpoints, taken exactly as the engine's own prefill takes
+        // them: one pass that snapshots the recurrent state at each (ingest_prompt_checkpointed),
+        // or -- where that declines, e.g. a segment under its 16-token minimum -- a pass per
+        // segment with a snapshot between. The split changes the arithmetic, so matching the
+        // engine's choice is what keeps a speculated request's tokens those of ordinary decode.
+        int done = prefill_from;
+        next = ingest_prompt_checkpointed(prompt.data(), prefill_from, n, hooks->ckpts,
+                                          hooks->n_ckpts, hooks->snaps, &done, false);
+        if (next >= 0 && done == n) {
+            ckpts_taken = true;
+        } else {
+            // A declined pass ran nothing.
+            int pos = prefill_from;
+            ckpts_taken = true;
+            for (int i = 0; i < hooks->n_ckpts; ++i) {
+                const int ck = hooks->ckpts[i];
+                // A segment that did not complete leaves no state to snapshot at `ck` (the engine's
+                // loop stops its checkpoints there too); the rest of the prompt still prefills.
+                if (prefill_range(pos, ck) < 0 || !snapshot_recurrent_state(sid, hooks->snaps[i]))
+                    ckpts_taken = false;
+                pos = ck;
+            }
+            next = prefill_range(pos, n);
+        }
+    } else {
+        next = prefill_range(prefill_from, n);
     }
+    // A sampled request's first token is drawn at step 0 from the last prompt position's logits,
+    // exactly as the engine's prefill does it (sample_seed_token), instead of the argmax.
+    const bool spec_sampled = hooks && hooks->temperature > 0.f;
+    if (spec_sampled && next >= 0 && next < s.cfg.vocab)
+        next = sample_seed_token(hooks->temperature, hooks->seed, 0, hooks->top_k, hooks->top_p);
     auto t1 = std::chrono::steady_clock::now();
     if (next < 0 || next >= s.cfg.vocab) {
         if (!hooks) close_session(sid);   // an engine session is re-prefilled by the caller
+        // ...from where it started, which for a prefix-cache hit is past zero: its recurrent state
+        // is restored only there, and this prefill may have advanced it. Fail the request rather
+        // than let it be prefilled again from a state that is no longer the prefix's.
+        if (hooks && prefill_from > 0 && resume) { resume->engaged = true; resume->failed = true; }
         set_dflash_capture(false, {}, 0);
         return out;
     }
+    if (resume) resume->ckpts_taken = ckpts_taken;
+    // Every verify row samples while this is set; cleared on every way out of this function.
+    struct VerifySamplingOff {
+        Impl& m;
+        ~VerifySamplingOff() { m.vsamp.on = false; }
+    } vsamp_off{s};
+    const float sp_temp = spec_sampled ? hooks->temperature : 0.f;
+    const unsigned long long sp_seed = spec_sampled ? hooks->seed : 0ull;
+    const int sp_top_k = spec_sampled ? hooks->top_k : 0;
+    const float sp_top_p = spec_sampled ? hooks->top_p : 1.f;
 
     draft.reset();
     int start = n;
@@ -5969,6 +7624,21 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         draft.reset();
         return out;
     }
+    // Engine-driven: the prefill's token is final, so hand it over now instead of after the verify
+    // graphs are recorded and the first draft and verify have run -- that was ~100 ms of every
+    // speculated request's time to first token. The first step then emits its block from row 1
+    // (pre_emitted). A run that ends before that step completes ingests the token itself below, so
+    // the caller resumes exactly where ordinary decode would.
+    int pre_emitted = 0;
+    bool early_eos = false, early_stop = false;
+    if (hooks) {
+        out.push_back(next);
+        pre_emitted = 1;
+        early_eos = !ignore_eos && (next == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && next == s.cfg.eos_id2));
+        engine_lock.unlock();
+        early_stop = !hooks->on_tokens(out.data(), 1);
+        engine_lock.lock();
+    }
     // Build the verify replay graph before the decode clock starts. Capture records kernels
     // rather than running them, so this changes no state -- it just stops decode step 2 from
     // paying for graph construction.
@@ -6119,9 +7789,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     long plan_rows_sum = 0, plan_steps = 0;
     bool predictable_stream = false;
     auto t_decode0 = std::chrono::steady_clock::now();
-    bool spec_finished = false, spec_failed = false, spec_stopped = false, spec_tier_stop = false;
+    bool spec_finished = early_eos, spec_failed = false, spec_stopped = early_stop, spec_tier_stop = false;
     if (hooks) engine_lock.unlock();
-    while ((int)out.size() < max_new) {
+    while (!spec_finished && !spec_stopped && (int)out.size() < max_new) {
         // Engine-driven: hold the device for the whole step -- draft pass and verify -- so a request
         // admitted concurrently allocates between steps, never inside one. Released before on_tokens.
         std::unique_lock<std::recursive_mutex> step_lock(s.device_mu, std::defer_lock);
@@ -6181,6 +7851,10 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                 ((disarmed_run - kDraftProbeAfter) % kDraftProbePeriod) != 0;
         block[0] = next;
         for (int i = 1; i < B; i++) block[i] = mask_id;
+        // block[0] is the response's token at index out.size() (emitted below); verify row i draws
+        // the token at index out.size() + 1 + i, which ordinary decode samples at that step.
+        const unsigned long long step0 = (unsigned long long)(out.size() - pre_emitted) + 1ull;
+        s.vsamp = {spec_sampled, sp_temp, sp_seed, sp_top_k, sp_top_p, step0};
 
         // The target overwrites dflash_hidden while capturing verify row zero. Preserve the
         // accepted suffix before running that target forward concurrently with the independent
@@ -6240,7 +7914,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
             set_dflash_capture_row(0);
             s.defer_decode_sync = overlap_on;
             auto _tf = std::chrono::steady_clock::now();
-            p0 = forward_token(block[0], start, true);
+            p0 = forward_token(block[0], start, true, sp_temp, sp_seed, step0, sp_top_k, sp_top_p);
             if (kTiming) { t_fwd_ms += ms_since(_tf); n_fwd++; }
             s.defer_decode_sync = false;
         }
@@ -6249,6 +7923,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // A NaN survivor means no head, and the planner falls back to the fixed depth.
         for (int i = 0; i <= active_proposal_depth; i++)
             draft_confidence[i] = std::numeric_limits<float>::quiet_NaN();
+        draft.set_sampling(sp_temp, sp_seed, step0, sp_top_k, sp_top_p);
         const bool draft_ok = draft_idle ? true : draft.forward_block(
             draft_hidden, th_len, block.data(), start, draft_ids.data(), nullptr, active_proposal_depth,
             draft_confidence.data(), th_start);
@@ -6435,7 +8110,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 if (i > 1 && confidence_gate_on && draft_confidence[i] < kConfidenceGate) break;
                 set_dflash_capture_row(i);
                 auto _tfi = std::chrono::steady_clock::now();
-                const int p = forward_token(block[i], start + i, true);
+                const int p = forward_token(block[i], start + i, true, sp_temp, sp_seed,
+                                            step0 + (unsigned long long)i, sp_top_k, sp_top_p);
                 if (kTiming) { t_fwd_ms += ms_since(_tfi); n_fwd++; }
                 if (p < 0) { vfail = true; break; }
                 posterior[i] = p;
@@ -6560,7 +8236,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
 
         const size_t emitted_before = out.size();
         bool stop = false;
-        for (int i = 0; i < keep && (int)out.size() < max_new; i++) {
+        for (int i = pre_emitted; i < keep && (int)out.size() < max_new; i++) {
             out.push_back(block[i]);
             if (!ignore_eos &&
                 (block[i] == s.cfg.eos_id || (s.cfg.eos_id2 >= 0 && block[i] == s.cfg.eos_id2))) {
@@ -6568,6 +8244,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 break;
             }
         }
+        pre_emitted = 0;
         bool eos_next = false;
         if (!stop) {
             // Bonus token becomes the next block seed (emitted on the following iteration).
@@ -6623,6 +8300,19 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     }
     if ((int)out.size() >= max_new) spec_finished = true;
     if (hooks) engine_lock.lock();   // the teardown below frees graphs and capture buffers
+    if (pre_emitted && !spec_finished && !spec_failed) {
+        // No step ran: the prefill's token went out but was never ingested. Ingest it the way the
+        // next ordinary decode step would -- position `start`, drawing the token after it at step 1
+        // -- and hand back from there.
+        set_dflash_capture_row(0);
+        const int after = forward_token(next, start, true, sp_temp, sp_seed, 1ull, sp_top_k, sp_top_p);
+        if (after >= 0 && after < s.cfg.vocab) {
+            next = after;
+            start += 1;
+        } else {
+            spec_failed = true;
+        }
+    }
     if (resume) {
         resume->engaged = true;
         resume->finished = spec_finished;
@@ -6656,7 +8346,7 @@ void* load_bin(const std::string& path, std::vector<void*>& owned) {
     f.read(host.data(), n);
     void* d = nullptr;
     if (cudaMalloc(&d, n) != cudaSuccess) return nullptr;
-    cudaMemcpy(d, host.data(), n, cudaMemcpyHostToDevice);
+    si_h2d_complete(d, host.data(), n, cudaMemcpyHostToDevice);
     owned.push_back(d);
     return d;
 }
@@ -6780,7 +8470,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         for (const auto& kv : had.signs_by_width) {
             void* d = nullptr;
             if (cudaMalloc(&d, kv.second.size()) != cudaSuccess) continue;
-            cudaMemcpy(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
+            si_h2d_complete(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
             s.bonsai_sign_dev[kv.first] = d;
             s.owned.push_back(d);
             s.bonsai_rot_elems = std::max(s.bonsai_rot_elems, kv.first);
@@ -6951,7 +8641,28 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         qtype = hb.ggml_type;
         void* d = nullptr;
         if (cudaMalloc(&d, hb.bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        if (ggml_requant_to_q4k(qtype)) {
+            const long nv = t->n_values;
+            void* deq = nullptr;
+            void* q4 = nullptr;
+            if (nv % 256 != 0 || t->dims[0] % 256 != 0 ||
+                cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess ||
+                cudaMalloc(&q4, (size_t)(nv / 256) * 144) != cudaSuccess) {
+                fprintf(stderr, "[gguf] %s: cannot refit ggml type %d to Q4_K (row %ld)\n",
+                        name.c_str(), qtype, (long)t->dims[0]);
+                cudaFree(deq); cudaFree(d);
+                return nullptr;
+            }
+            kernels::launch_gguf_dequant(qtype, d, deq, nv, s.stream);
+            kernels::launch_proj_requant_q4k_lloyd(deq, q4, nv, s.stream);
+            cudaStreamSynchronize(s.stream);
+            cudaFree(deq);
+            cudaFree(d);
+            s.owned.push_back(q4);
+            qtype = 12;
+            return q4;
+        }
         s.owned.push_back(d);
         return d;
     };
@@ -7065,7 +8776,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             return nullptr;
         }
         void* dq = nullptr; cudaMalloc(&dq, hb.bytes);
-        cudaMemcpy(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
         if (!dq || !tmp) {
             // Say so. Returning a silent nullptr here surfaces as whichever tensor the caller
@@ -7277,7 +8988,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                         src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             return d;
         }
@@ -7288,12 +8999,42 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto upload_plain_native = [&](const GGUFTensor* t) -> void* {
         void* d = nullptr;
         if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             return d;
         }
         cudaFree(d);
         return nullptr;
+    };
+    // Q5_K projections (llama.cpp "UD" quants use it for most GDN/attention matrices) have no
+    // kernel of their own. SPARKINFER_GGUF_Q5K_PROJ picks how they enter:
+    //   q4k  (default) Lloyd Q4_K refit, 0.56 B/weight. On Qwen3.8-27B-UD-Q4_K_M: decode 83.4
+    //        tok/s, prefill@128 3,885; KL vs llama.cpp 0.0255, perplexity +1.2% vs bf16.
+    //   q8   Q8_0 refit, 1.06 B/weight, near-lossless (KL 0.0209); decode 78.8, prefill@128 1,888.
+    //   bf16 dequantized, 2 B/weight (the behaviour before the refit existed); decode 71.1.
+    static const std::string q5k_proj_mode = [] {
+        const char* e = getenv("SPARKINFER_GGUF_Q5K_PROJ");
+        return std::string(e ? e : "q4k");
+    }();
+    auto q5k_proj = [&](const std::string& name, int& type) -> const void* {
+        if (q5k_proj_mode == "q4k") return dev_quant_requant_q4k(name, type, true, true);
+        if (q5k_proj_mode != "q8") return nullptr;
+        const GGUFTensor* t = g.tensor(name);
+        const long nv = t->n_values;
+        const void* src = dev_quant(name, type);
+        if (!src || type != 13) return src;
+        void* deq = nullptr;
+        void* q8 = nullptr;
+        if (cudaMalloc(&deq, (size_t)nv * 2) != cudaSuccess) return src;
+        if (cudaMalloc(&q8, (size_t)(nv / 32) * 34) != cudaSuccess) { cudaFree(deq); return src; }
+        kernels::launch_gguf_dequant(13, src, deq, nv, s.stream);
+        kernels::launch_requant_q8_0(deq, q8, nv, s.stream);
+        cudaStreamSynchronize(s.stream);
+        cudaFree(deq);
+        if (!s.owned.empty() && s.owned.back() == src) { s.owned.pop_back(); cudaFree((void*)src); }
+        s.owned.push_back(q8);
+        type = 8;
+        return q8;
     };
     auto attn_w_base = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
@@ -7322,6 +9063,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
+        if (qattn && t && ggml_requant_to_q4k(t->ggml_type)) return dev_quant(name, type);
+        if (qattn && t && t->ggml_type == 13)
+            if (const void* p = q5k_proj(name, type)) return p;
         type = 0; return dense(name, false);
     };
     // attn_w_base, plus the decode shadow's ternary copy of the projections its parts name.
@@ -7366,7 +9110,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             s.bonsai_sign_dev.count(t->dims[0])) {
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                 s.owned.push_back(d);
                 type = kPtq1GgmlType;
                 return d;
@@ -7393,6 +9137,9 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (qattn && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
+        if (qattn && ggml_requant_to_q4k(t->ggml_type)) return dev_quant(name, type);
+        if (qattn && t->ggml_type == 13)
+            if (const void* p = q5k_proj(name, type)) return p;
         type = 0; return dense(name, false);
     };
     // Muse Glimmer ships output.weight as Q5_K -- the only Q5_K tensor in the file -- and Q5_K was
@@ -7412,7 +9159,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
             void* d = nullptr;
             if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
-                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                si_h2d_complete(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                 s.owned.push_back(d);
                 type = kPtq1GgmlType;
                 return d;
@@ -7487,7 +9234,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         s.bonsai_sign_dev.count(emb_t->dims[0])) {
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             s.w.embed_tokens = d;
             s.bonsai_embed_native = true;              // 0.28 GB of table instead of 2.54 in bf16
@@ -7509,7 +9256,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         emb_t->ggml_type == 12 && emb_t->dims[0] == H && (H % 256) == 0) {
         void* d = nullptr;
         if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
-            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            si_h2d_complete(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
             s.owned.push_back(d);
             s.w.embed_tokens = d;
             s.w.embed_type = 12;
@@ -7569,15 +9316,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             if (!w.ssm_dt) w.ssm_dt = dense(b + "ssm_dt.bias", false);
             w.ssm_a = v_regroup(b + "ssm_a");
             if (!w.ssm_a) w.ssm_a = dense(b + "ssm_a", false);
+            // alpha/beta are [H, v_heads] (48 outputs): every batched path (packed decode, the
+            // verify, mixed steps) reads them as bf16 through the fused two-projection GEMV, and
+            // Q8_0 has no 48-wide row kernel there, so a UD GGUF that ships them as Q8_0 declined
+            // every packed step at layer 0. Prefill already dequantizes them to bf16 for accuracy
+            // (they feed the GDN sigmoid gates); load them that way. 0.5 MB per layer.
+            auto ab_w = [&](const std::string& name, int& type) -> const void* {
+                const GGUFTensor* t = g.tensor(name);
+                if (t && t->ggml_type == 8) { type = 0; return dense(name, false); }
+                return attn_w(name, type);
+            };
             if (const void* bp = v_regroup(b + "ssm_beta.weight")) {
                 w.ssm_beta = bp; w.ssm_beta_type = 0;
             } else {
-                w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
+                w.ssm_beta = ab_w(b + "ssm_beta.weight", w.ssm_beta_type);
             }
             if (const void* ap = v_regroup(b + "ssm_alpha.weight")) {
                 w.ssm_alpha = ap; w.ssm_alpha_type = 0;
             } else {
-                w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+                w.ssm_alpha = ab_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
             }
             w.ssm_norm = dense(b + "ssm_norm.weight", false);
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
@@ -7709,7 +9466,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
             w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
             w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
-            w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
+            // Routed expert downs shipped as Q5_K / Q6_K (Qwen3.6-35B-A3B UD keeps them at Q5_K) are
+            // refit to Q4_K at load, so every routed down read is 4.5 bits a weight instead of 5.5 --
+            // what an NVFP4 expert pool reads. Lossy, as the default Q8_0 -> Q4_K attention refit
+            // above is: over three 4K-token corpus slices perplexity moved -1.7 / -0.3 / +1.7% and
+            // next-token agreement -0.2 / -0.2 / -0.1 points. Served Qwen3.6 (AIPerf chat) c4 / c16
+            // / c32 +3% / +3% / +4%, 8K prompts c4 / c16 +10% / +2%.
+            // SPARKINFER_MOE_DOWN_REQUANT_Q4K=0 keeps the GGUF's own down tensor (qwen3_gguf_score
+            // sets that, so teacher-forced scoring reads the checkpoint as shipped).
+            // On by default for the Qwen3.6 hybrid-MoE fingerprint it was measured on; other MoE
+            // checkpoints take it with SPARKINFER_MOE_DOWN_REQUANT_Q4K=1.
+            static const int moe_down_env = [] {
+                const char* e = getenv("SPARKINFER_MOE_DOWN_REQUANT_Q4K");
+                return e ? (e[0] == '1' ? 1 : 0) : -1;
+            }();
+            const bool moe_down_q4k = moe_down_env >= 0 ? moe_down_env == 1
+                                                         : is_qwen35_or_qwen36_hybrid_moe(g);
+            w.down_q = moe_down_q4k
+                ? dev_quant_requant_q4k(b + "ffn_down_exps.weight", w.down_qtype, true, /*allow_q5k=*/true)
+                : dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
             if (s.cfg.n_shared > 0) {
             if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||
@@ -8070,17 +9845,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // batched-prefill arena still allocates, and prefill@128 is 1.05x the down-only build.
         // A card that genuinely cannot spare it still declines here, and declines for the real
         // reason rather than for its label.
+        // How many sessions this deployment will actually hold. The KV pool is allocated
+        // before this point and was sized for exactly that, so it already carries the number
+        // rather than needing one plumbed in.
+        int fp4_sessions = 1;
+        if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
+            const int bps = c.max_seq / s.kv->block_size() + 4;   // blocks one session takes
+            if (bps > 0) fp4_sessions = s.kv->num_total_blocks() / bps;
+            if (fp4_sessions < 1)   fp4_sessions = 1;
+            if (fp4_sessions > 256) fp4_sessions = 256;
+        }
         {
-            // How many sessions this deployment will actually hold. The KV pool is allocated
-            // before this point and was sized for exactly that, so it already carries the number
-            // rather than needing one plumbed in.
-            int fp4_sessions = 1;
-            if (s.kv && s.kv->block_size() > 0 && c.max_seq > 0) {
-                const int bps = c.max_seq / s.kv->block_size() + 4;   // blocks one session takes
-                if (bps > 0) fp4_sessions = s.kv->num_total_blocks() / bps;
-                if (fp4_sessions < 1)   fp4_sessions = 1;
-                if (fp4_sessions > 256) fp4_sessions = 256;
-            }
             // A reserve that covers ONE session's prefill arena is what starved the runtime under
             // concurrency: every live request needs its own scratch beside these weights, so at 32
             // requests the card finished with 3 MB free -- the packed decode arena (16 MB) declined
@@ -8342,10 +10117,17 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         // What it must leave is the runtime's own allocation after load, measured at ~576 MiB at 8
         // sessions: a 512 MiB margin starves the batched-prefill scratch and halves throughput, so
         // the default keeps 1024. SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB tunes it; 0 restores main.
+        // That allocation grows with the sessions held, and a flat 1024 at 33 sessions sat on a
+        // knife edge: peak use differed by 16 MB between runs, and in two runs of five the graph
+        // captures and the verify scratch then failed for lack of it (Muse cb c32 2140 -> 380
+        // tok/s, mean ITL 13 -> 82 ms). 16 MB per session past 17 keeps c16 and below exactly as
+        // they were (49/52 layers at 17 sessions) and leaves 1280 at 33: 12/52 layers, 5/5 runs
+        // at ~2127 tok/s.
         const long long down_keep_mb = [&] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_KEEP_MB");
             if (e) return atoll(e);
-            return c.max_seq >= 16384 ? 2560LL : 1024LL;
+            if (c.max_seq >= 16384) return 2560LL;
+            return 1024LL + 16LL * std::max(0, fp4_sessions - 17);
         }();
         if (ok && down_eligible && !down_fp4_on && down_keep_mb > 0) {
             const size_t per_layer = kernels::prefill_nvfp4_data_bytes(H, c.moe_ffn) +
@@ -8561,7 +10343,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, t->data, (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, t->data, (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -8595,7 +10377,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -8635,7 +10417,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)n_values * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, transformed.data(), (size_t)n_values * 2, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -8662,8 +10444,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&wd, (size_t)rows * cols) != cudaSuccess) return nullptr;
         if (cudaMalloc(&scd, (size_t)rows * 2) != cudaSuccess) { cudaFree(wd); return nullptr; }
         if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) { cudaFree(wd); cudaFree(scd); return nullptr; }
-        cudaMemcpy(wd, w->data, (size_t)rows * cols, cudaMemcpyHostToDevice);
-        cudaMemcpy(scd, sc->data, (size_t)rows * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(wd, w->data, (size_t)rows * cols, cudaMemcpyHostToDevice);
+        si_h2d_complete(scd, sc->data, (size_t)rows * 2, cudaMemcpyHostToDevice);
         kernels::launch_ct_dequant_fp8(wd, scd, out, rows, cols, s.stream);
         cudaStreamSynchronize(s.stream);
         cudaFree(wd); cudaFree(scd);
@@ -8688,8 +10470,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         const size_t w_bytes = (size_t)rows * (size_t)cols;
         void* packed = nullptr;
         if (cudaMalloc(&packed, scale_bytes + w_bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(packed, sc->data, scale_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(packed) + scale_bytes, w->data, w_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(packed, sc->data, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(packed) + scale_bytes, w->data, w_bytes, cudaMemcpyHostToDevice);
         s.owned.push_back(packed);
         qtype = kernels::SI_QTYPE_FP8;
         return packed;
@@ -8808,9 +10590,9 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         void* payload = nullptr;
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
-        cudaMemcpy(payload, &global_scale, 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
+        si_h2d_complete(payload, &global_scale, 4, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         // SPARKINFER_QWEN38_PREFILL_NVFP4=0 drops the checkpoint-native NVFP4 copies once they
         // have been consumed to build the Q4_K decode weights. In the default configuration they
@@ -8891,8 +10673,8 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         if (cudaMalloc(&out, (size_t)rows * cols * 2) != cudaSuccess) {
             cudaFree(pd); cudaFree(gd); return nullptr;
         }
-        cudaMemcpy(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(pd, src.packed, packed_bytes, cudaMemcpyHostToDevice);
+        si_h2d_complete(gd, src.group, scale_bytes, cudaMemcpyHostToDevice);
         kernels::launch_ct_dequant_nvfp4(pd, gd, src.global, out, rows, cols, s.stream);
         // CHECKED, because an unchecked failure here is invisible in the worst possible way: the
         // output buffer is left as cudaMalloc returned it and the caller requantizes that into a
@@ -8936,7 +10718,7 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         }
         void* d = nullptr;
         if (cudaMalloc(&d, (size_t)rows * cols * 2) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, w->data, (size_t)rows * cols * 2, cudaMemcpyHostToDevice);
+        si_h2d_complete(d, w->data, (size_t)rows * cols * 2, cudaMemcpyHostToDevice);
         return d;   // caller owns, same contract as dequant_fp8 / dequant_nvfp4
     };
 
@@ -8989,10 +10771,10 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
         void* payload = nullptr;
         if (cudaMalloc(&payload, hdr + scale_bytes + packed_bytes) != cudaSuccess) return nullptr;
         cudaMemset(payload, 0, hdr);
-        cudaMemcpy(payload, &src.global, 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
+        si_h2d_complete(payload, &src.global, 4, cudaMemcpyHostToDevice);
+        si_h2d_complete(static_cast<char*>(payload) + hdr, src.group, scale_bytes,
                    cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
+        si_h2d_complete(static_cast<char*>(payload) + hdr + scale_bytes, src.packed, packed_bytes,
                    cudaMemcpyHostToDevice);
         s.owned.push_back(payload);
         qtype = kernels::SI_QTYPE_NVFP4;

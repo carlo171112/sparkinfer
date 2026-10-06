@@ -264,6 +264,9 @@ __global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                          OutT* __restrict__ y, int N, int K) {
     constexpr int RPB = GEMV_WPB / S;
     __shared__ float part[M][RPB][S];
+    // grid.y > 1: one launch of several M-row chunks, chunk blockIdx.y at rows [M * y, M * y + M)
+    x += (size_t)blockIdx.y * M * K;
+    y += (size_t)blockIdx.y * M * N;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / S, split = warp % S;
     const int n = blockIdx.x * RPB + row_local;
@@ -1938,6 +1941,9 @@ __global__ void si_mmvq_q80_rows_exact_kernel(const si_block_q8_1* __restrict__ 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int row = blockIdx.x;
     if (row >= N) return;
+    // grid.y > 1: one launch of several MMAX-row chunks (launch_mmvq_q80_rows_chunks)
+    q += (size_t)blockIdx.y * MMAX * NBLOCKS;
+    y += (size_t)blockIdx.y * MMAX * N;
     const unsigned char* w_row = W + (size_t)row * NBLOCKS * 34;
     float tmp[MMAX];
     #pragma unroll
@@ -3090,7 +3096,37 @@ void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaS
 template <typename T, int S>
 static bool launch_gemv_rows_t(const void* x, const void* W, T* y,
                                int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1 || (K & 7)) return false;
+    if (M < 1 || N < 1 || (K & 7)) return false;
+    // More than eight rows go in launches of eight. A row's sum does not depend on how many rows
+    // share the launch (launch_gemv_rows2 relies on the same), so every row is what a lone launch
+    // of it computes. Declining instead turned away every packed batch of 9+ rows whose bf16
+    // projection or MoE router reads this -- Qwen3.6-35B-A3B decoded 16 / 32 concurrent requests
+    // one forward each, below a single stream's aggregate (~460 against ~500 tok/s).
+    //
+    // The whole 8-row chunks share one launch, chunk on grid.y. Launched one after another, each
+    // filled only N / RPB CTAs (128 for Qwen3.6's 256-expert router, on 170 SMs), so a 32-row
+    // router was four back-to-back underfilled launches. SPARKINFER_GEMV_ROWS_FUSE=0 restores the
+    // launch per chunk.
+    if (M > 8) {
+        static const bool fuse = [] {
+            const char* e = getenv("SPARKINFER_GEMV_ROWS_FUSE");
+            return !(e && e[0] == '0');
+        }();
+        const int full = M / 8;
+        int r0 = 0;
+        if (fuse && full > 1) {
+            constexpr int RPB = GEMV_WPB / S;
+            const dim3 grid((N + RPB - 1) / RPB, full);
+            gemv_bf16_rows_sk_kernel<T, S, 8><<<grid, GEMV_WPB * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+            r0 = full * 8;
+        }
+        for (; r0 < M; r0 += 8)
+            if (!launch_gemv_rows_t<T, S>(static_cast<const __nv_bfloat16*>(x) + (size_t)r0 * K, W,
+                                          y + (size_t)r0 * N, M - r0 < 8 ? M - r0 : 8, N, K, stream))
+                return false;
+        return true;
+    }
     constexpr int RPB = GEMV_WPB / S;
     dim3 grid((N + RPB - 1) / RPB);
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
@@ -4182,7 +4218,10 @@ constexpr int SI_AM_SK_DEF = 8;
 // SI_AM_NACC is the widest projection a packed step hands this arm: Qwen3.8's 12288-row q|gate. At
 // 6656 -- Muse Glimmer's widest -- a 32-row q|gate overflowed the slot and had to be split into two
 // 16-row launches, each re-reading the whole 35 MB weight. 32 x 12288 floats is 1.5 MB a slot.
-constexpr int SI_AM_NACC = 12288;
+// 20480 now: a 32-row FFN gate / up on Qwen3.8-27B (17408) or Muse Glimmer (19968) overran 12288
+// and ran as two 16-row launches, each streaming the whole 50 MB weight (q4k_rows_bench:
+// 17408 x 5120 at 32 rows 76 us, i.e. 656 GB/s). 32 x 20480 floats is 2.6 MB a slot.
+constexpr int SI_AM_NACC = 20480;
 constexpr int SI_AM_SLOTS = 4;
 __device__ float si_am_acc[SI_AM_SLOTS][SI_AM_MMAX * SI_AM_NACC];
 
@@ -4456,6 +4495,116 @@ void si_mmvq_q4k_mma_kernel(const si_block_q8_1* __restrict__ q, const unsigned 
             }
 }
 
+// ---- Q4_K x Q8_1 rows on the int8 tensor cores, register-direct ----
+// si_mmvq_q4k_mma_kernel stages each CTA's activation and weight tile through shared memory for a
+// single super-block and synchronises around it; at 32 rows that staging alone measured ~75% of
+// the kernel (q4k_rows_bench: 15.5 of ~20 us on an 8192 x 2048 projection with the math removed),
+// and the kernel reached 360-480 GB/s. Here each warp owns 16 weight rows -- the mma A operand --
+// for every token (8-row B tiles) across a run of whole super-blocks, and loads both operands
+// straight into registers: one 32-bit word of a Q4_K quant plane carries two sub-blocks' nibbles
+// for four K values, so a mask or a shift is the int8 operand, and the activations are the same
+// ~70 KB every warp reads, so they come from L1. No shared memory, no block barrier, and warps are
+// independent, so split-K buys the parallelism that hides the DRAM latency. Same fold-in as the
+// staged kernel: ((dm.x * sc) * Ad) * dot - (dm.y * m) * Asum per 32-value group. Partials go to
+// the same split-K accumulator and epilogue.
+template <int NT8, int RT>
+__global__ __launch_bounds__(128) void si_q4k_rows_mma2_kernel(
+    const si_block_q8_1* __restrict__ q, const unsigned char* __restrict__ W,
+    float* __restrict__ acc_out, int M, int N, int K) {
+    // RT 16-row weight tiles per warp: every activation fragment and scale a warp loads feeds RT
+    // mma instead of one.
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 16 * RT;
+    if (n0 >= N) return;
+    const int nsb = K >> 8, nb32 = K >> 5;
+    const int S = (int)gridDim.y, sp = (int)blockIdx.y;
+    const int sb_lo = (nsb * sp) / S, sb_hi = (nsb * (sp + 1)) / S;
+    const si_block_q4_K* wr[RT][2];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = n0 + r * 16 + grp + h * 8;
+            wr[r][h] = reinterpret_cast<const si_block_q4_K*>(W + (size_t)(row < N ? row : N - 1) * nsb * 144);
+        }
+    float facc[RT][NT8][4];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int t = 0; t < NT8; ++t) facc[r][t][0] = facc[r][t][1] = facc[r][t][2] = facc[r][t][3] = 0.f;
+    for (int sb = sb_lo; sb < sb_hi; ++sb) {
+        unsigned qw[RT][2][4][2];
+        float2 dm[RT][2];
+        unsigned sc[RT][2][2], mn[RT][2][2];
+#pragma unroll
+        for (int r = 0; r < RT; ++r)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const si_block_q4_K* bk = wr[r][h] + sb;
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    qw[r][h][p][0] = *reinterpret_cast<const unsigned*>(bk->qs + 32 * p + tig * 4);
+                    qw[r][h][p][1] = *reinterpret_cast<const unsigned*>(bk->qs + 32 * p + 16 + tig * 4);
+                }
+                dm[r][h] = __half22float2(bk->dm);
+                si_am_scales8(bk->scales, sc[r][h], mn[r][h]);
+            }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int p = j >> 1, sh = (j & 1) * 4, bs = 8 * (j & 3);
+            const unsigned m4 = 0x0f0f0f0fu;
+            const int kb = sb * 8 + j;
+#pragma unroll
+            for (int t = 0; t < NT8; ++t) {
+                const int tok = t * 8 + grp;
+                unsigned bf0 = 0, bf1 = 0;
+                if (tok < M) {
+                    const si_block_q8_1* x = q + (size_t)tok * nb32 + kb;
+                    bf0 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                    bf1 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                }
+                const int ta = t * 8 + tig * 2, tb = ta + 1;
+                float2 da = make_float2(0.f, 0.f), db = make_float2(0.f, 0.f);
+                if (ta < M) da = __half22float2((q + (size_t)ta * nb32 + kb)->ds);
+                if (tb < M) db = __half22float2((q + (size_t)tb * nb32 + kb)->ds);
+#pragma unroll
+                for (int r = 0; r < RT; ++r) {
+                    const unsigned a0 = (qw[r][0][p][0] >> sh) & m4, a1 = (qw[r][1][p][0] >> sh) & m4;
+                    const unsigned a2 = (qw[r][0][p][1] >> sh) & m4, a3 = (qw[r][1][p][1] >> sh) & m4;
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, "
+                                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bf0), "r"(bf1));
+                    const float sw0 = dm[r][0].x * (float)((sc[r][0][j >> 2] >> bs) & 0xFFu);
+                    const float mw0 = dm[r][0].y * (float)((mn[r][0][j >> 2] >> bs) & 0xFFu);
+                    const float sw1 = dm[r][1].x * (float)((sc[r][1][j >> 2] >> bs) & 0xFFu);
+                    const float mw1 = dm[r][1].y * (float)((mn[r][1][j >> 2] >> bs) & 0xFFu);
+                    facc[r][t][0] += sw0 * da.x * (float)c0 - mw0 * da.y;
+                    facc[r][t][1] += sw0 * db.x * (float)c1 - mw0 * db.y;
+                    facc[r][t][2] += sw1 * da.x * (float)c2 - mw1 * da.y;
+                    facc[r][t][3] += sw1 * db.x * (float)c3 - mw1 * db.y;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int t = 0; t < NT8; ++t) {
+            const int ta = t * 8 + tig * 2, tb = ta + 1;
+            const int ra = n0 + r * 16 + grp, rb = ra + 8;
+            if (ra < N) {
+                if (ta < M) atomicAdd(acc_out + (size_t)ta * N + ra, facc[r][t][0]);
+                if (tb < M) atomicAdd(acc_out + (size_t)tb * N + ra, facc[r][t][1]);
+            }
+            if (rb < N) {
+                if (ta < M) atomicAdd(acc_out + (size_t)ta * N + rb, facc[r][t][2]);
+                if (tb < M) atomicAdd(acc_out + (size_t)tb * N + rb, facc[r][t][3]);
+            }
+        }
+}
+
 // Narrows the split-K accumulator into the caller's bf16 output and re-zeroes what it consumed,
 // which is what lets the accumulator be a static buffer with no per-call memset.
 __global__ void si_mmvq_q4k_mma_epilogue_kernel(float* __restrict__ acc,
@@ -4592,6 +4741,47 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     float* acc = nullptr;
     if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
     acc += (size_t)slot * (size_t)SI_AM_MMAX * (size_t)SI_AM_NACC;
+    // Register-direct arm (si_q4k_rows_mma2_kernel). Split K so the device holds ~16 warps an SM.
+    // SPARKINFER_Q4K_MMA2=0 keeps the staged kernel; SPARKINFER_Q4K_MMA2_SPLITS pins the split.
+    static const int mma2 = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    static const int mma2_splits = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_SPLITS");
+        return e ? atoi(e) : 0;
+    }();
+    static const int mma2_rt = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_RT");
+        const int v = e ? atoi(e) : 2;
+        return (v == 1 || v == 4) ? v : 2;
+    }();
+    static const int mma2_target = [] {
+        const char* e = getenv("SPARKINFER_Q4K_MMA2_WARPS");
+        const int v = e ? atoi(e) : 1024;
+        return v > 0 ? v : 1024;
+    }();
+    if (mma2 && !(N % (16 * mma2_rt))) {
+        const int warps = N / (16 * mma2_rt);
+        int S = mma2_splits > 0 ? mma2_splits : (mma2_target + warps - 1) / warps;
+        if (S < 1) S = 1;
+        if (S > nblk) S = nblk;
+        const dim3 g((warps + 3) / 4, S), b(128);
+        const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
+        const unsigned char* wa = reinterpret_cast<const unsigned char*>(W);
+#define SI_MMA2(NT8_) do { if (mma2_rt == 2) si_q4k_rows_mma2_kernel<NT8_, 2><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); \
+                          else if (mma2_rt == 4) si_q4k_rows_mma2_kernel<NT8_, 4><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); \
+                          else si_q4k_rows_mma2_kernel<NT8_, 1><<<g, b, 0, stream>>>(qa, wa, acc, M, N, K); } while (0)
+        if (M <= 8)       SI_MMA2(1);
+        else if (M <= 16) SI_MMA2(2);
+        else if (M <= 24) SI_MMA2(3);
+        else              SI_MMA2(4);
+#undef SI_MMA2
+        const size_t n = (size_t)M * (size_t)N;
+        si_mmvq_q4k_mma_epilogue_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+            acc, reinterpret_cast<__nv_bfloat16*>(y), n);
+        return true;
+    }
     {
         // The split that kept the grid a whole wave has to grow as CG divides its N extent.
         const int nsk2 = (cg >= 4 && nsk * 2 <= (K >> 8)) ? nsk * 2 : nsk;
@@ -5313,7 +5503,11 @@ bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
     // attn_v, so without this width every one of those layers refuses the multi-row path -- and
     // refuses it SILENTLY, since a false here is indistinguishable at the call site from "this
     // weight type is not implemented". Same reason 20/24 were added to the Q4_K launcher above.
-    if (M < 1 || M > 8 || N < 1 || (K != 2048 && K != 4096 && K != 6656)) return false;
+    // 20 / 24 (5120 / 6144): Qwen3.8-27B's residual and GDN widths. llama.cpp "UD" GGUFs put Q6_K
+    // (and Q8_0, below) on some of its attention matrices, and each such layer declined the packed
+    // step the same silent way.
+    if (M < 1 || M > 8 || N < 1 ||
+        (K != 2048 && K != 4096 && K != 5120 && K != 6144 && K != 6656)) return false;
     const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const auto* w = reinterpret_cast<const unsigned char*>(W);
     auto* out = reinterpret_cast<__nv_bfloat16*>(y);
@@ -5324,13 +5518,16 @@ bool launch_mmvq_q6k_rows(const void* q81, const void* W, void* y,
         } while (0)
     if      (K == 2048) SI_Q6K_ROWS_DISPATCH(8);
     else if (K == 4096) SI_Q6K_ROWS_DISPATCH(16);
+    else if (K == 5120) SI_Q6K_ROWS_DISPATCH(20);
+    else if (K == 6144) SI_Q6K_ROWS_DISPATCH(24);
     else                SI_Q6K_ROWS_DISPATCH(26);
     #undef SI_Q6K_ROWS_DISPATCH
     return true;
 }
 bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
                           int M, int N, int K, cudaStream_t stream) {
-    if (M < 1 || M > 8 || N < 1 || (K != 512 && K != 2048 && K != 4096)) return false;
+    if (M < 1 || M > 8 || N < 1 ||
+        (K != 512 && K != 2048 && K != 4096 && K != 5120 && K != 6144)) return false;
     // The 6-row instantiations already exist (and the Q4_K launcher below picks them); this one
     // always asked for the 8-row body, so a 6-row block ran two predicated rows of tmp[]/partial[]
     // and the reduction over them for nothing.
@@ -5345,8 +5542,24 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
     } while (0)
     if (K == 512)       SI_Q80_ROWS(16);
     else if (K == 2048) SI_Q80_ROWS(64);
-    else                SI_Q80_ROWS(128);
+    else if (K == 4096) SI_Q80_ROWS(128);
+    else if (K == 5120) SI_Q80_ROWS(160);
+    else                SI_Q80_ROWS(192);
 #undef SI_Q80_ROWS
+    return true;
+}
+// `chunks` whole 8-row chunks of the Q8_0 rows kernel in one launch, chunk on grid.y; each row's
+// arithmetic is the 8-row launch's. false (nothing launched) for a K it has no body for.
+static bool launch_mmvq_q80_rows_chunks(const void* q81, const void* W, void* y,
+                                        int chunks, int N, int K, cudaStream_t stream) {
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(y);
+    const dim3 grid(N, chunks);
+    if (K == 512)       si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else if (K == 2048) si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else if (K == 4096) si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else return false;
     return true;
 }
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
@@ -5413,7 +5626,17 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
         }
     }
     if (M > 8) {
-        for (int r0 = 0; r0 < M; r0 += 8) {
+        // Q8_0: the whole 8-row chunks in one launch (each chunk alone is N CTAs -- 512 for
+        // Qwen3.6's k / v -- and four of them ran back to back at 32 rows).
+        // SPARKINFER_GEMV_ROWS_FUSE=0 launches every chunk on its own.
+        static const bool fuse = [] {
+            const char* e = getenv("SPARKINFER_GEMV_ROWS_FUSE");
+            return !(e && e[0] == '0');
+        }();
+        int r_done = 0;
+        if (fuse && qtype == 8 && M / 8 > 1 && launch_mmvq_q80_rows_chunks(q81, W, y, M / 8, N, K, stream))
+            r_done = (M / 8) * 8;
+        for (int r0 = r_done; r0 < M; r0 += 8) {
             const int m = (M - r0) < 8 ? (M - r0) : 8;
             if (!launch_mmvq_rows(qtype,
                                   reinterpret_cast<const si_block_q8_1*>(q81)
@@ -5488,20 +5711,28 @@ bool launch_mmvq_rows_f32(int qtype, const void* q81, const void* W, float* y,
         #undef SI_Q4K_ROWS_F32_DISPATCH
         return true;
     }
-    if (qtype == 14 && (K == 2048 || K == 4096)) {
+    if (qtype == 14 && (K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
         if (K == 2048)
             si_mmvq_q6k_rows_exact_kernel<float, 8, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        else
+        else if (K == 4096)
             si_mmvq_q6k_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else if (K == 5120)
+            si_mmvq_q6k_rows_exact_kernel<float, 20, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q6k_rows_exact_kernel<float, 24, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
-    if (qtype == 8 && (K == 512 || K == 2048 || K == 4096)) {
+    if (qtype == 8 && (K == 512 || K == 2048 || K == 4096 || K == 5120 || K == 6144)) {
         if (K == 512)
             si_mmvq_q80_rows_exact_kernel<float, 16, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         else if (K == 2048)
             si_mmvq_q80_rows_exact_kernel<float, 64, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
-        else
+        else if (K == 4096)
             si_mmvq_q80_rows_exact_kernel<float, 128, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else if (K == 5120)
+            si_mmvq_q80_rows_exact_kernel<float, 160, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
+        else
+            si_mmvq_q80_rows_exact_kernel<float, 192, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, M, N);
         return true;
     }
     return false;

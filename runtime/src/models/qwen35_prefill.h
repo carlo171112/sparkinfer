@@ -139,6 +139,14 @@ struct Qwen35PrefillCtx {
     // run: the buffer is carved from the verify arena, whose layout is fixed across passes, so it
     // holds this pass's logits until the next verify pass.
     float**              packed_logits_out = nullptr;
+    // dflash_verify_short_run as a PREFILL of n known tokens (Qwen35Model::ingest_tail_rows):
+    // verify_eager runs it without the verify graph cache -- no flush, no replay, no recording --
+    // so a call for a session other than the cached one leaves packed decode's graphs alone;
+    // verify_commit_all commits every row, where a speculative verify keeps only the accepted
+    // prefix; verify_logits_out receives the address of the rows' logits ([n, vocab] fp32).
+    bool                 verify_eager = false;
+    bool                 verify_commit_all = false;
+    float**              verify_logits_out = nullptr;
     // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
     // and its attention q/k/v and output projections from their ternary legs through the
     // arithmetic single-row decode runs on them, so every row decodes bit-identically batched or
@@ -177,8 +185,32 @@ struct Qwen35PrefillCtx {
     // Optional: redraws prompt i's seed with its request's sampler. Called after prompt i's
     // argmax is read back, with its last-position logits still in `logits`; returns the token to
     // keep, or -1 to keep the argmax. Null keeps every argmax.
+    // Packed prompts' prefix-cache checkpoints, at most one per prompt. multi_ckpt_row[i] > 0 is
+    // the row inside prompt i after which every Gated-DeltaNet layer's scan state and conv window
+    // go to multi_ckpt_host[i] -- pinned host memory in ckpt_host's layout, with ckpt_state_bytes
+    // as for ckpt_host. That prompt's conv and scan run in two parts carrying the state across,
+    // on the pass's own stream. Null, or a row of 0, takes no checkpoint for that prompt.
+    const int*           multi_ckpt_row   = nullptr;
+    void* const*         multi_ckpt_host  = nullptr;
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
+    // A MIXED step's prompt chunks (mix_n > 0 with multi_n > 0): the segments follow the decode
+    // rows (multi_off[0] == mix_n) and may resume mid-prompt -- multi_pos0[i] is segment i's first
+    // position (host; null = all 0): its state is reset only at 0, its conv carries the session's
+    // window in and its scan the session's recurrence, and its attention appends at that position.
+    // multi_no_seed skips the per-prompt seeds (no chunk finishes its prompt) and multi_seed may
+    // then be null; otherwise multi_want_seed (null = all) names the segments that end their
+    // prompts and take one. Qwen35Model::mixed_step_multi.
+    const int*           multi_pos0       = nullptr;
+    bool                 multi_no_seed    = false;
+    const unsigned char* multi_want_seed  = nullptr;
+    // dflash_verify_short_run (not packed): when set, it replaces the verify rows' argmax with the
+    // request's sampled tokens before the accepted prefix is chosen. `logits` is the device
+    // [n, vocab] buffer the verify head wrote (it may be masked in place); `out_ids` is the host
+    // array the argmax was read into. False on a CUDA error, which fails the verify before
+    // anything is committed.
+    bool               (*verify_sample)(void* user, float* logits, int n, int* out_ids) = nullptr;
+    void*                verify_sample_user = nullptr;
 
     // PREFIX-CACHE CHECKPOINTS TAKEN INSIDE THE PASS (one prompt, never a pack). After row
     // ckpt_rows[i] - 1 of this pass (ascending, 0 < row < N), every Gated-DeltaNet layer's scan
@@ -198,6 +230,48 @@ struct Qwen35PrefillCtx {
     // it otherwise, so a caller that can free something (the Bonsai decode shadow, see #1154's
     // rejection) can tell "worth retrying" from "give up now". Null is fine; nothing is recorded.
     bool*                scratch_oom_out  = nullptr;
+
+    // GROUPED SPECULATIVE VERIFY (Qwen35Model::verify_grouped). group_n > 0 makes
+    // dflash_verify_short_run's N rows group_n sequences' verify blocks laid end to end: group g is
+    // rows [group_off[g], group_off[g] + group_len[g]), consecutive positions of its own session.
+    // Attention takes the per-row tables and positions packed decode takes (packed_rows /
+    // packed_rows_win / packed_pos must be set for every row); the GDN conv and scan run per group
+    // against group_lin_conv[g] / group_lin_state[g] without touching them, and each group's
+    // accepted prefix is then committed into its own state, its length written to group_keep[g].
+    // HOST arrays of group_n entries. Run with verify_eager (no graph cache).
+    int                  group_n          = 0;
+    const int*           group_off        = nullptr;
+    const int*           group_len        = nullptr;
+    float* const*        group_lin_state  = nullptr;
+    void* const*         group_lin_conv   = nullptr;
+    int*                 group_keep       = nullptr;
+    // Optional, per group: commit every row (prompt rows ingested in the verify, not proposals).
+    const bool*          group_commit_all = nullptr;
+
+    // MIXED STEP (Qwen35Model::mixed_step). mix_n > 0 puts mix_n packed DECODE rows at rows
+    // [0, mix_n) of prefill_batched_run's pass, ahead of the prompt chunk it was called for, which
+    // then occupies rows [mix_n, n) at positions pos0.. of seq_id. Everything row-wise -- the
+    // norms, the projections, the FFN -- runs once over all n rows, so the decode rows ride the
+    // chunk's weight reads. What belongs to a sequence runs apart: the decode rows take packed
+    // decode's kernels (the batched GDN step on their own conv windows and states, the per-row
+    // QK-norm/RoPE/KV append, split-KV decode attention over their own block tables), the chunk
+    // takes the prefill's. Qwen3.8 (dense hybrid, int8 KV, no windowed slices) only; a pass that
+    // cannot take it declines before its first kernel.
+    int                  mix_n            = 0;
+    const int* const*    mix_rows         = nullptr;   // [mix_n] device: block-table pointers
+    int*                 mix_btab         = nullptr;   // [mix_n, max_blocks] device scratch
+    const int*           mix_pos          = nullptr;   // [mix_n] device: each row's position
+    const int*           mix_seq          = nullptr;   // [mix_n] device: each row's length (pos+1)
+    int                  mix_seq_hint     = 0;         // host: the longest row's length
+    float* const*        mix_lin_state    = nullptr;   // [mix_n] device: GDN state bases
+    void* const*         mix_lin_conv     = nullptr;   // [mix_n] device: GDN conv-window bases
+    bool                 mix_state_b16    = false;     // the rows' state is the compacted bf16 form
+    int                  mix_splits       = 0;         // split-KV count for the decode attention
+    float*               mix_fa           = nullptr;   // split scratch: m, l [mix_n*q_heads*splits], acc [.. *head_dim]
+    void*                mix_q81          = nullptr;   // [mix_n] Q8_1 rows for the LM head
+    float*               mix_logits       = nullptr;   // [mix_n, vocab] fp32: the decode rows' logits
+    int*                 mix_d_out        = nullptr;   // [mix_n] device argmax
+    int*                 mix_out          = nullptr;   // [mix_n] host argmax, filled when the pass returns
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

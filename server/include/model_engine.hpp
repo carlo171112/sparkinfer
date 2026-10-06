@@ -211,7 +211,8 @@ public:
                                             on_token_logprob = nullptr,
                                         const std::vector<int>& forced_tokens = {},
                                         const PreparedImages* images = nullptr,
-                                        std::shared_ptr<sparkinfer::TokenConstraint> constraint = nullptr);
+                                        std::shared_ptr<sparkinfer::TokenConstraint> constraint = nullptr,
+                                        bool ignore_eos = false);
 
     // TEACHER-FORCED SCORING (POST /v1/score): non-empty `forced_tokens` turns the call into a
     // scoring pass instead of a generation. max_new_tokens must equal forced_tokens.size(); the
@@ -258,6 +259,13 @@ public:
     // SPARKINFER_DSPARK_MAX_CTX (default 16384) -- its KV and projection buffers scale with it, and a
     // request that needs more simply decodes ordinarily. Call after load().
     bool load_draft(const std::string& dir, std::string& err);
+    // Grow the KV pool into the device memory left free once everything that loads at startup
+    // (target, draft, vision tower) is resident, keeping SPARKINFER_KV_HEADROOM_GIB (default 6)
+    // free for the packed-decode graphs and batched-prefill scratch that the first requests
+    // allocate. load() sizes the pool to one --ctx, which at 8K prompts admits only a handful of
+    // concurrent requests while gigabytes sit unused. Call after load() / load_draft(), before
+    // serving. SPARKINFER_KV_GROW=0 keeps the --ctx-sized pool.
+    void grow_kv_pool();
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;
@@ -269,6 +277,8 @@ public:
         uint64_t lookups = 0, hits = 0, tokens_reused = 0, inserts = 0, evictions = 0;
         size_t entries = 0, host_bytes = 0;
         int blocks = 0;
+        uint64_t host_hits = 0, demotions = 0;   // the host KV tier
+        size_t host_entries = 0, host_kv_bytes = 0;
     };
     PrefixCacheStats prefix_cache_stats() const;
 

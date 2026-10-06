@@ -1046,6 +1046,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Everything that loads at startup is resident now; give the KV pool what is left above the
+    // serving headroom.
+    engine.grow_kv_pool();
+
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
         engine.set_prefix_tokens(prefix_ids);
@@ -1293,11 +1297,23 @@ int main(int argc, char** argv) {
                  << "sparkinfer_prefix_cache_kv_blocks " << pc.blocks << "\n"
                  << "# HELP sparkinfer_prefix_cache_host_bytes Pinned host memory held by recurrent-state snapshots\n"
                     "# TYPE sparkinfer_prefix_cache_host_bytes gauge\n"
-                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n";
+                 << "sparkinfer_prefix_cache_host_bytes " << pc.host_bytes << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_hits_total Hits served from the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_host_hits_total counter\n"
+                 << "sparkinfer_prefix_cache_host_hits_total " << pc.host_hits << "\n"
+                 << "# HELP sparkinfer_prefix_cache_demotions_total Cached prefixes moved off the device to the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_demotions_total counter\n"
+                 << "sparkinfer_prefix_cache_demotions_total " << pc.demotions << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_entries Cached prefixes whose KV is on the host only\n"
+                    "# TYPE sparkinfer_prefix_cache_host_entries gauge\n"
+                 << "sparkinfer_prefix_cache_host_entries " << pc.host_entries << "\n"
+                 << "# HELP sparkinfer_prefix_cache_host_kv_bytes Pinned host memory held by the host KV tier\n"
+                    "# TYPE sparkinfer_prefix_cache_host_kv_bytes gauge\n"
+                 << "sparkinfer_prefix_cache_host_kv_bytes " << pc.host_kv_bytes << "\n";
         }
         const auto sp = engine.speculative_stats();
         if (sp.enabled) {
-            body << "# HELP sparkinfer_speculative_runs_total Requests decoded speculatively (DSpark)\n"
+            body << "# HELP sparkinfer_speculative_runs_total Requests decoded speculatively (with the loaded draft)\n"
                     "# TYPE sparkinfer_speculative_runs_total counter\n"
                  << "sparkinfer_speculative_runs_total " << sp.runs << "\n"
                  << "# HELP sparkinfer_speculative_tokens_total Tokens produced by speculative decoding\n"
@@ -1695,6 +1711,16 @@ int main(int argc, char** argv) {
                  // rejects tools + response_format together at request time.
                  const bool json_mode_active =
                      chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText;
+                 // A JSON response ends where its grammar does: past the closing brace only end-of-turn
+                 // tokens are allowed, so generating on to max_tokens would emit nothing but those and
+                 // fail the output's validation. Refused rather than silently ignored.
+                 if (json_mode_active && controls.ignore_eos) {
+                     g_requests_client_error++;
+                     res.status = 400;
+                     res.set_content("{\"error\":{\"message\":\"ignore_eos cannot be combined with "
+                                     "response_format\"}}", "application/json");
+                     return;
+                 }
                  if (!max_tokens_set)
                      max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
@@ -1758,6 +1784,7 @@ int main(int argc, char** argv) {
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
                           frequency_penalty = controls.frequency_penalty,
+                          ignore_eos = controls.ignore_eos,
                           logit_bias = controls.logit_bias,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs,
                           n = controls.n]
@@ -2058,7 +2085,8 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
-                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
+                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained),
+                                     ignore_eos);
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -2507,7 +2535,8 @@ int main(int argc, char** argv) {
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                              controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
-                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
+                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained),
+                             controls.ignore_eos);
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())
@@ -2851,6 +2880,7 @@ int main(int argc, char** argv) {
                           top_k = controls.top_k, top_p = controls.top_p,
                           presence_penalty = controls.presence_penalty,
                           frequency_penalty = controls.frequency_penalty,
+                          ignore_eos = controls.ignore_eos,
                           logit_bias = controls.logit_bias,
                           logprobs = controls.logprobs, top_logprobs = controls.top_logprobs,
                           n = controls.n]
@@ -2936,7 +2966,8 @@ int main(int argc, char** argv) {
                                               : nullptr;
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
-                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob);
+                                     logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
+                                     {}, nullptr, nullptr, ignore_eos);
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -3113,7 +3144,8 @@ int main(int argc, char** argv) {
                      const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                          controls.temperature, branch_seed, controls.top_k, controls.top_p,
                          controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
-                         controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob);
+                         controls.logprobs, controls.top_logprobs, maybe_on_tok_logprob, {}, nullptr, nullptr,
+                         controls.ignore_eos);
                      if (logprob_entries.size() > outcome.tokens.size())
                          logprob_entries.resize(outcome.tokens.size());
                      out.prompt_tokens = (long long)prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;

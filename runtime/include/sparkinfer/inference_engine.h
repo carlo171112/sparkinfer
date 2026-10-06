@@ -3,6 +3,7 @@
 #include "sparkinfer/token_constraint.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -42,6 +43,9 @@ class ContinuousBatchEngine {
 public:
     struct Request {
         std::vector<int> prompt;
+        // Generate all max_new_tokens whatever the model emits (end-of-turn tokens included), as
+        // benchmark clients ask for a fixed output length. Such a request does not speculate.
+        bool ignore_eos = false;
         int max_new_tokens = 0;
         int priority = 0;
         int prefill_start = 0;          // skip tokens already in a shared prefix cache
@@ -244,8 +248,9 @@ public:
     int max_queue_depth() const;
 
     // Speculative decoding (DSpark) for a request that runs alone. Requires a draft attached to the
-    // model (Qwen35Model::set_dflash_draft). A greedy request with no constraint, penalties,
-    // logit_bias, logprobs, images or prefix-cache hit decodes speculatively while it is the only
+    // model (Qwen35Model::set_dflash_draft). A greedy or temperature/top_k/top_p-sampled request
+    // with no constraint, penalties, logit_bias, logprobs, images or prefix-cache hit decodes
+    // speculatively while it is the only
     // request; the moment another is submitted it continues as ordinary decode and joins the batch.
     // The tokens are the same either way -- speculation only changes how many target passes produce
     // them.
@@ -261,6 +266,9 @@ public:
     // Turn on the automatic prefix cache. Off by default: benchmarks and the eval harness measure
     // prefill from zero, and a cache hit would change what they measure. Call before submitting.
     void enable_prefix_cache(const PrefixCache::Limits& limits);
+    // Drop the prefix cache and everything it holds (its blocks go back to the pool). For a pool
+    // re-size at startup; enable_prefix_cache() builds a fresh one afterwards.
+    void disable_prefix_cache();
     // All zeros while the cache is off.
     PrefixCache::Stats prefix_cache_stats() const;
 
@@ -276,11 +284,34 @@ private:
     // Advance a whole decode batch in ONE packed forward instead of one forward per sequence.
     // Returns false having done NOTHING when the batch is not eligible, so the caller falls back
     // to stepping the jobs individually. `any_finished` is set if any job completed.
-    bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished);
+    // One prompt's part of a mixed step: up to `max` tokens of `job`'s prefill from its
+    // prefill_pos; `finish` when they reach the prompt's end and the step is to produce its first
+    // token. `done` is what the step ingested (0 when it could not mix).
+    struct MixChunk {
+        Job* job = nullptr;
+        int max = 0;
+        bool finish = false;
+        int done = 0;
+    };
+    // With `chunks`, the first packed group also carries those prompts' chunks in the same forward
+    // (Qwen35Model::mixed_step_multi), each chunk's `done` set to what it ingested; a chunk that
+    // finished its prompt leaves its job in DECODE with the first token pending, as a packed
+    // prefill does.
+    bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
+                          std::vector<MixChunk>* chunks = nullptr);
+    // The prompts a mixed step would carry this iteration (empty when nothing is eligible or
+    // mixing is off, SPARKINFER_MIXED_CHUNK), and the scheduled prefills it can never carry, which
+    // step_job runs as before.
+    void pick_mixed_chunks(const std::vector<uint64_t>& prefill_ids, int n_decode, std::vector<MixChunk>& chunks,
+                           std::vector<uint64_t>& unmixable);
+    bool run_mixed_chunks(const std::vector<int>& toks, const std::vector<int>& pos,
+                          const std::vector<uint64_t>& seqs, std::vector<int>& out,
+                          const Qwen35Model::PackedSampling* samp, std::vector<MixChunk>& chunks);
     // Prefill the fresh, text-only prompts among `prefill_ids` together, in packs, instead of one
     // pass each (Qwen35Model::ingest_prompts_packed). Packed jobs move to DECODE and are removed
     // from `prefill_ids`; everything else is left for step_job exactly as before.
     void step_prefills_packed(std::vector<uint64_t>& prefill_ids);
+    int pack_checkpoint(const Job& j) const;
     // Constrained decoding: rebuild the job's dense logit bias from its constraint's next-token mask
     // (on top of its own logit_bias) and upload it for the next sample. False when the constraint
     // allows no token at all.
@@ -290,7 +321,12 @@ private:
     void finish_job_impl(Job& j);
     // Runs job speculatively until it finishes or another request arrives; see enable_speculative.
     void run_speculative(Job& job);
+    // Concurrent speculation (SPARKINFER_SPEC_GROUP, default 8): up to that many live requests speculate
+    // together, one verify pass for all of them (Qwen35Model::spec_group_*). Returns when no member
+    // is left, or hands every member to ordinary decode when a request it cannot take arrives.
+    void run_spec_group();
     static bool spec_eligible(const Request& r);
+    static bool spec_adoptable(const Job& j);
 
     Qwen35Model* model_;
     KVCacheManager* kv_;
@@ -317,7 +353,15 @@ private:
     bool speculative_ = false;
     std::atomic<bool> spec_running_{false};    // the worker is inside run_speculative
     std::atomic<bool> spec_interrupt_{false};  // a request was submitted meanwhile: hand over
+    // How long live requests have been more than a speculation group takes. Past
+    // SPARKINFER_DRAFT_OFFLOAD_MS of that, the draft's device memory goes to the host until a
+    // group can form again (DFlashDraftModel::offload).
+    bool spec_over_ = false;
+    std::chrono::steady_clock::time_point spec_over_since_{};
     std::atomic<uint64_t> spec_runs_{0}, spec_tokens_{0}, spec_handoffs_{0}, spec_tier_stops_{0};
+    // Last count of blocks only the prefix cache holds (num_free_kv_blocks), refreshed whenever the
+    // device mutex is free to read the KV refcounts under.
+    mutable std::atomic<int> evictable_last_{0};
 };
 
 }  // namespace sparkinfer

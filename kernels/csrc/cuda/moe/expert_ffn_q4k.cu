@@ -1111,6 +1111,111 @@ __global__ void gate_up_mmvq2_qwen_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// gate/up of a k-quant pair that is not Q4_K/Q4_K. llama.cpp "UD" GGUFs give a layer's gate and
+// up different types (Q4_K beside Q5_K, the odd Q6_K), and every mmvq arm above hard-codes the
+// 144-byte Q4_K block, so such a layer fell through to gate_up_q4k_kernel, which dequantizes in
+// fp32 at well under half the bandwidth (Qwen3.8-27B-UD-Q4_K_M: 149 vs 65 us per layer, 19 of its
+// 64 layers). Same 4-warp tiling as gate_up_mmvq2_qwen_kernel -- 8 super-blocks in flight, 16
+// threads per super-block, each covering 16 of its values -- with the dot picked per tensor:
+// Q4_K and Q5_K share the position index kqs; Q6_K's index counts 8 values, so it takes two.
+template <int T>
+__device__ __forceinline__ float si_gu_kq_dot(const unsigned char* row, int kbx,
+                                              const si_block_q8_1* vb, int kqs) {
+    if constexpr (T == 12)
+        return si_vec_dot_q4_K((const si_block_q4_K*)row + kbx, vb, kqs);
+    else if constexpr (T == 13)
+        return si_vec_dot_q5_K((const si_block_q5_K*)row + kbx, vb, kqs);
+    else
+        return si_vec_dot_q6_K(row + (size_t)kbx * 210, vb, kqs) +
+               si_vec_dot_q6_K(row + (size_t)kbx * 210, vb, kqs + 1);
+}
+template <int T> __host__ __device__ constexpr int si_gu_kq_bytes() { return T == 12 ? 144 : T == 13 ? 176 : 210; }
+
+template <int GT, int UT>
+__global__ void gate_up_mmvq2_kq_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int H, int F, int top_k, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int row = blockIdx.x, ts = row / F, f = row - ts * F, tok = ts / top_k;
+    const int e = expert_ids[ts];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    const int NB = H >> 8;
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const unsigned char* g_row = gate_q + ((size_t)e * F + f) * NB * si_gu_kq_bytes<GT>();
+    const unsigned char* u_row = up_q   + ((size_t)e * F + f) * NB * si_gu_kq_bytes<UT>();
+    float tg = 0.f, tu = 0.f;
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+        tg += si_gu_kq_dot<GT>(g_row, kbx, vrow + (size_t)kbx * 8, kqs);
+        tu += si_gu_kq_dot<UT>(u_row, kbx, vrow + (size_t)kbx * 8, kqs);
+    }
+    __shared__ float sg[NW - 1][WS], su[NW - 1][WS];
+    if (warp > 0) { sg[warp - 1][lane] = tg; su[warp - 1][lane] = tu; }
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) { tg += sg[l][lane]; tu += su[l][lane]; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+    if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
+    if (pdl) si_pdl_lc();
+}
+
+// gate_up_mmvq2_kq_kernel for a packed batch at top_k == 1: the row loop moves inside, so for a
+// dense FFN (every row on expert 0) each super-block is fetched from DRAM once per chunk of up to
+// MM rows rather than once per row (16 rows: 1.0 ms -> one pass per layer). Rows address their own
+// expert, so a top_k == 1 MoE stays correct; it just has nothing to share. Each row's arithmetic is the one-row
+// kernel's -- same kbx walk, same dots, same 4-warp then butterfly reduction -- so every output is
+// bit-identical to that launch.
+template <int GT, int UT, int MM>
+__global__ void gate_up_mmvq2_kq_rows_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int H, int F, int m, int pdl
+) {
+    constexpr int NW = 4, WS = 32;
+    const int f = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4;
+    const int kqs = 2 * (tid & 15);
+    const int NB = H >> 8;
+    float tg[MM], tu[MM];
+#pragma unroll
+    for (int r = 0; r < MM; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    for (int kbx = kbx0; kbx < NB; kbx += 8) {
+#pragma unroll
+        for (int r = 0; r < MM; ++r) {
+            if (r < m) {
+                const size_t ef = (size_t)expert_ids[r] * F + f;
+                const si_block_q8_1* v = vy + (size_t)r * (H >> 5) + (size_t)kbx * 8;
+                tg[r] += si_gu_kq_dot<GT>(gate_q + ef * NB * si_gu_kq_bytes<GT>(), kbx, v, kqs);
+                tu[r] += si_gu_kq_dot<UT>(up_q   + ef * NB * si_gu_kq_bytes<UT>(), kbx, v, kqs);
+            }
+        }
+    }
+    __shared__ float sg[MM][NW - 1][WS], su[MM][NW - 1][WS];
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < MM; ++r) { sg[r][warp - 1][lane] = tg[r]; su[r][warp - 1][lane] = tu[r]; }
+    }
+    __syncthreads();
+    if (warp > 0) return;
+#pragma unroll
+    for (int r = 0; r < MM; ++r) {
+        if (r >= m) break;
+        float g = tg[r], u = tu[r];
+#pragma unroll
+        for (int l = 0; l < NW - 1; l++) { g += sg[r][l][lane]; u += su[r][l][lane]; }
+#pragma unroll
+        for (int k = 16; k > 0; k >>= 1) { g += __shfl_xor_sync(0xffffffff, g, k); u += __shfl_xor_sync(0xffffffff, u, k); }
+        if (lane == 0) h_scratch[(size_t)r * F + f] = q4kf_silu(g) * u;
+    }
+    if (pdl) si_pdl_lc();
+}
+
 // M token rows against ONE set of gate/up rows, in a single pass over those weights.
 //
 // gate_up_mmvq2_qwen_kernel above is launched with a grid of num_tokens*TOPK*F blocks, so the
@@ -1277,6 +1382,258 @@ __global__ void gate_up_mmvq2_warp_qwen_kernel(
     for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
     if (pdl) si_pdl_lc();
+}
+
+// gate_up_mmvq2_warp_qwen_kernel with R consecutive f rows of one (token, expert) pair per warp.
+// A lane's activation slice -- the two q8_1 blocks si_vec_dot_q4_K reads at (kbx, iqs) -- depends
+// on the token and K position only, never on f, so one warp per f re-read the token's whole
+// activation row for every output: at 32 rows on Qwen3.6 that was ~300 MB of L2 traffic a layer on
+// top of the weights. Here it is loaded once per super-block and dotted against R rows' weights.
+// Each row's partials are the same expressions in the same order as si_vec_dot_q4_K and the
+// butterfly is the same, so every output is bit-identical to the one-row-per-warp kernel.
+struct si_q8a { int u[4]; float d8[2]; };
+__device__ __forceinline__ si_q8a si_q8a_load(const si_block_q8_1* bq8_1, int iqs) {
+    si_q8a a;
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const si_block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+        a.d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
+        a.u[2 * i] = q8[0]; a.u[2 * i + 1] = q8[4];
+    }
+    return a;
+}
+__device__ __forceinline__ float si_vec_dot_q4_K_wa(const si_q4k_wdec& w, const si_q8a& a) {
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int v0i = (w.v0 >> (4 * i)) & 0x0F0F0F0F, v1i = (w.v1 >> (4 * i)) & 0x0F0F0F0F;
+        const int dot1 = __dp4a(v1i, a.u[2 * i + 1], __dp4a(v0i, a.u[2 * i], 0));
+        const int dot2 = __dp4a(0x01010101, a.u[2 * i + 1], __dp4a(0x01010101, a.u[2 * i], 0));
+        sumf_d += a.d8[i] * (dot1 * w.sc[i]);
+        sumf_m += a.d8[i] * (dot2 * w.m[i]);
+    }
+    return w.d * sumf_d - w.dmin * sumf_m;
+}
+
+// Pair order by expert for the batched gate/up: perm[i] is the i-th (token, slot) pair with the
+// pairs of one expert next to each other. A warp's output position is its pair's own, so the order
+// changes only when each weight row is read: the pairs that share an expert run back to back and
+// its rows are still in L2 for the second one, instead of coming from DRAM once per pair.
+constexpr int SI_MOE_PERM_MAX = 1024;
+// The grouped gate/up takes an expert's pairs at most this many to a warp, so a popular expert is
+// spread over several warps rather than one warp's serial passes (gate/up 97 -> 91 us a layer at
+// c32); the down keeps whole segments, since its warp holds the weights in registers across pairs.
+constexpr int SI_MOE_CHUNK = 4;
+// One per stream (moe_slot_for), so two streams running a grouped MoE step never share them.
+struct SiMoeSlot {
+    int perm[SI_MOE_PERM_MAX];
+    int seg[SI_MOE_PERM_MAX + 2];                  // [0..nseg] perm offsets, then nseg itself
+    int segc[SI_MOE_PERM_MAX + 2];                 // the same split into chunks of <= SI_MOE_CHUNK pairs
+    float dpart[SI_MOE_PERM_MAX * 2048];           // grouped down: one dot per (pair, hidden row)
+};
+constexpr int SI_MOE_SLOTS = 4;
+__device__ SiMoeSlot si_moe_slots[SI_MOE_SLOTS];
+// This stream's slot, first call wins (as si_am_slot_for in gemv.cu); nullptr once all are taken,
+// and the caller then keeps the per-pair kernels.
+static SiMoeSlot* moe_slot_for(cudaStream_t stream) {
+    static std::mutex mu;
+    static cudaStream_t owners[SI_MOE_SLOTS] = {};
+    static int used = 0;
+    static SiMoeSlot* base = nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!base && cudaGetSymbolAddress(reinterpret_cast<void**>(&base), si_moe_slots) != cudaSuccess) {
+        base = nullptr;
+        return nullptr;
+    }
+    for (int i = 0; i < used; i++) if (owners[i] == stream) return base + i;
+    if (used >= SI_MOE_SLOTS) return nullptr;
+    owners[used] = stream;
+    return base + used++;
+}
+// Exclusive prefix over a 256-thread block (one value each); *total gets the block sum.
+__device__ __forceinline__ int si_block256_excl_scan(int v, int* wsum, int* total) {
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    int inc = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { const int x = __shfl_up_sync(0xffffffff, inc, o); if (lane >= o) inc += x; }
+    __syncthreads();
+    if (lane == 31) wsum[w] = inc;
+    __syncthreads();
+    int base = inc - v, all = 0;
+    for (int k = 0; k < 8; ++k) { if (k < w) base += wsum[k]; all += wsum[k]; }
+    *total = all;
+    return base;
+}
+// 256 threads, 4 counters each, so expert ids 0..1023. Besides perm it writes the expert segments:
+// seg[0..nseg] are the perm offsets where each routed expert's pairs start (seg[nseg] = n_pairs),
+// and segc[0..nsegc] the same with every segment cut into chunks of at most SI_MOE_CHUNK pairs.
+// An id outside that range (not expected: the arm is gated to Qwen3.6's 256 experts) makes every
+// pair its own segment in token order, which the grouped kernels run exactly as the per-pair ones.
+__global__ void __launch_bounds__(256) moe_pair_sort_kernel(const int* __restrict__ expert_ids, int n_pairs,
+                                                           int* __restrict__ perm, int* __restrict__ seg,
+                                                           int* __restrict__ nseg, int* __restrict__ segc,
+                                                           int* __restrict__ nsegc) {
+    constexpr int NE = 1024;
+    __shared__ int cnt[NE];
+    __shared__ int wsum[8];
+    __shared__ int out_of_range;
+    const int t = threadIdx.x;
+    for (int e = t; e < NE; e += 256) cnt[e] = 0;
+    if (t == 0) out_of_range = 0;
+    __syncthreads();
+    for (int i = t; i < n_pairs; i += 256) {
+        const int e = expert_ids[i];
+        if ((unsigned)e < (unsigned)NE) atomicAdd(&cnt[e], 1); else out_of_range = 1;
+    }
+    __syncthreads();
+    if (out_of_range) {
+        for (int i = t; i < n_pairs; i += 256) { perm[i] = i; seg[i] = i; segc[i] = i; }
+        if (t == 0) { seg[n_pairs] = n_pairs; *nseg = n_pairs; segc[n_pairs] = n_pairs; *nsegc = n_pairs; }
+        return;
+    }
+    // thread t owns cnt[4t..4t+3]
+    const int c0 = cnt[4 * t], c1 = cnt[4 * t + 1], c2 = cnt[4 * t + 2], c3 = cnt[4 * t + 3];
+    int tot;
+    const int base = si_block256_excl_scan(c0 + c1 + c2 + c3, wsum, &tot);
+    const int o0 = base, o1 = o0 + c0, o2 = o1 + c1, o3 = o2 + c2;
+    int ns;
+    int k = si_block256_excl_scan((c0 > 0) + (c1 > 0) + (c2 > 0) + (c3 > 0), wsum, &ns);
+    if (c0) seg[k++] = o0;
+    if (c1) seg[k++] = o1;
+    if (c2) seg[k++] = o2;
+    if (c3) seg[k++] = o3;
+    if (t == 0) { seg[ns] = n_pairs; *nseg = ns; }
+    constexpr int CH = SI_MOE_CHUNK;
+    const int k0 = (c0 + CH - 1) / CH, k1 = (c1 + CH - 1) / CH, k2 = (c2 + CH - 1) / CH, k3 = (c3 + CH - 1) / CH;
+    int nc;
+    k = si_block256_excl_scan(k0 + k1 + k2 + k3, wsum, &nc);
+    for (int q = 0; q < k0; ++q) segc[k++] = o0 + q * CH;
+    for (int q = 0; q < k1; ++q) segc[k++] = o1 + q * CH;
+    for (int q = 0; q < k2; ++q) segc[k++] = o2 + q * CH;
+    for (int q = 0; q < k3; ++q) segc[k++] = o3 + q * CH;
+    if (t == 0) { segc[nc] = n_pairs; *nsegc = nc; }
+    cnt[4 * t] = o0; cnt[4 * t + 1] = o1; cnt[4 * t + 2] = o2; cnt[4 * t + 3] = o3;
+    __syncthreads();
+    for (int i = t; i < n_pairs; i += 256) perm[atomicAdd(&cnt[expert_ids[i]], 1)] = i;
+}
+
+// The batched Qwen3.6 gate/up by expert: a warp takes R f rows of one routed expert and runs them
+// against every (token, slot) pair routed to it, PM pairs at a time. Each weight word is decoded
+// once per PM pairs instead of once per pair, so at decode routing (~3 pairs an expert at 32 rows)
+// the expert rows come in from DRAM about once rather than once per pair. Every output keeps the
+// per-pair kernel's arithmetic: the same lane partials in the same kbx order and the same
+// butterfly, so h is bit-identical to gate_up_mmvq2_warp_qwen_kernel's.
+template <int H, int F, int TOPK, int WARPS, int R, int PM>
+__global__ void __launch_bounds__(WARPS * 32) gate_up_mmvq2_group_qwen_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, const int* __restrict__ perm, const int* __restrict__ seg,
+    const int* __restrict__ nseg) {
+    constexpr int FB = F / R;                // warps per expert
+    const int lane = threadIdx.x & 31;
+    const int n_tasks = *nseg * FB;
+    for (int g = blockIdx.x * WARPS + (int)(threadIdx.x >> 5); g < n_tasks; g += gridDim.x * WARPS) {
+    const int s = g / FB;
+    const int f0 = (g - s * FB) * R;
+    const int lo = seg[s], hi = seg[s + 1];
+    const int e = expert_ids[perm[lo]];
+    const int kbx0 = lane >> 4;
+    const int kqs = 2 * (lane & 15);
+    constexpr int NB = H >> 8;
+    const size_t rstride = (size_t)NB * 144;
+    const unsigned char* g_base = gate_q + ((size_t)e * F + f0) * rstride;
+    const unsigned char* u_base = up_q   + ((size_t)e * F + f0) * rstride;
+    for (int c0 = lo; c0 < hi; c0 += PM) {
+        const int np = min(PM, hi - c0);
+        int ts[PM];
+        const si_block_q8_1* vrow[PM];
+#pragma unroll
+        for (int p = 0; p < PM; ++p) {
+            ts[p] = perm[c0 + (p < np ? p : 0)];
+            vrow[p] = vy + (size_t)(ts[p] / TOPK) * (H >> 5);
+        }
+        float tg[R][PM], tu[R][PM];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int p = 0; p < PM; ++p) { tg[r][p] = 0.f; tu[r][p] = 0.f; }
+        for (int kbx = kbx0; kbx < NB; kbx += 2) {
+            si_q8a a[PM];
+#pragma unroll
+            for (int p = 0; p < PM; ++p) if (p < np) a[p] = si_q8a_load(vrow[p] + (size_t)kbx * 8, kqs);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const si_q4k_wdec wg = si_q4k_decode_w((const si_block_q4_K*)(g_base + r * rstride) + kbx, kqs);
+                const si_q4k_wdec wu = si_q4k_decode_w((const si_block_q4_K*)(u_base + r * rstride) + kbx, kqs);
+#pragma unroll
+                for (int p = 0; p < PM; ++p) if (p < np) {
+                    tg[r][p] += si_vec_dot_q4_K_wa(wg, a[p]);
+                    tu[r][p] += si_vec_dot_q4_K_wa(wu, a[p]);
+                }
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < PM; ++p) if (p < np) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) {
+                    tg[r][p] += __shfl_xor_sync(0xffffffff, tg[r][p], m);
+                    tu[r][p] += __shfl_xor_sync(0xffffffff, tu[r][p], m);
+                }
+                if (lane == 0) h_scratch[(size_t)ts[p] * F + f0 + r] = q4kf_silu(tg[r][p]) * tu[r][p];
+            }
+        }
+    }
+    }
+}
+
+template <int H, int F, int TOPK, int WARPS, int R>
+__global__ void gate_up_mmvq2_warp_rows_qwen_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, int n_groups, const int* __restrict__ perm) {
+    const int lane = threadIdx.x & 31;
+    const int g = blockIdx.x * WARPS + (int)(threadIdx.x >> 5);   // group of R rows
+    if (g >= n_groups) return;
+    const int row0 = g * R;
+    const int sp = row0 / F, f0 = row0 - sp * F;
+    const int ts = perm ? perm[sp] : sp, tok = ts / TOPK;
+    const int e = expert_ids[ts];
+    const int kbx0 = lane >> 4;
+    const int kqs = 2 * (lane & 15);
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    constexpr int NB = H >> 8;
+    const size_t rstride = (size_t)NB * 144;
+    const unsigned char* g_base = gate_q + ((size_t)e * F + f0) * rstride;
+    const unsigned char* u_base = up_q   + ((size_t)e * F + f0) * rstride;
+    float tg[R], tu[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { tg[r] = 0.f; tu[r] = 0.f; }
+    for (int kbx = kbx0; kbx < NB; kbx += 2) {
+        const si_q8a a = si_q8a_load(vrow + (size_t)kbx * 8, kqs);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const si_block_q4_K* gb = (const si_block_q4_K*)(g_base + r * rstride) + kbx;
+            const si_block_q4_K* ub = (const si_block_q4_K*)(u_base + r * rstride) + kbx;
+            tg[r] += si_vec_dot_q4_K_wa(si_q4k_decode_w(gb, kqs), a);
+            tu[r] += si_vec_dot_q4_K_wa(si_q4k_decode_w(ub, kqs), a);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            tg[r] += __shfl_xor_sync(0xffffffff, tg[r], m);
+            tu[r] += __shfl_xor_sync(0xffffffff, tu[r], m);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) h_scratch[(size_t)ts * F + f0 + r] = q4kf_silu(tg[r]) * tu[r];
+    }
 }
 
 template <int H, int F, int TOPK>
@@ -1596,6 +1953,187 @@ __global__ void down_q5k_mmvq_kernel(
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
 }
 
+// The batched Qwen3.6 Q5_K down by expert, the counterpart of gate_up_mmvq2_group_qwen_kernel: a
+// warp takes R hidden rows of one routed expert, decodes its slice of their weights once (at
+// F = 512 that is one Q5_K word pair a lane a row) and keeps it in registers while it walks every
+// (token, slot) pair routed to that expert. Each pair's dot -- the same lane partial as
+// si_vec_dot_q5_K and the same butterfly -- goes to dpart[pair][hh] unweighted, and
+// moe_down_combine_kernel then sums a token's top_k of them in slot order. That order differs from
+// down_q5k_mmvq_kernel (which weights the lane partials before the butterfly), so the rounding
+// differs from it, but every launch computes the same bits: nothing depends on scheduling.
+struct si_q5k_wdec { int v0i[2], v1i[2]; unsigned char sc[2], m[2]; float d, dmin; };
+__device__ __forceinline__ si_q5k_wdec si_q5k_decode_w(const si_block_q5_K* bq5, int iqs) {
+    si_q5k_wdec w;
+    const int L = iqs >> 1;
+    const int bq8_offset = 2 * (L / 4);
+    const int* q4 = (const int*)(bq5->qs + 16 * bq8_offset + 4 * (L % 4));
+    const int v0 = q4[0], v1 = q4[4];
+    const int* qhp = (const int*)(bq5->qh + 4 * (L % 4));
+    const int qh0 = qhp[0], qh1 = qhp[4];
+    const unsigned short* scales = (const unsigned short*)bq5->scales;
+    unsigned short aux[2]; const int j = bq8_offset / 2;
+    if (j < 2) { aux[0] = scales[j] & 0x3f3f; aux[1] = scales[j + 2] & 0x3f3f; }
+    else { aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+           aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j]     & 0xc0c0) >> 2); }
+    const unsigned char* sc = (const unsigned char*)aux;
+    w.sc[0] = sc[0]; w.sc[1] = sc[1]; w.m[0] = sc[2]; w.m[1] = sc[3];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int hs = bq8_offset + i;
+        w.v0i[i] = ((v0 >> (4 * i)) & 0x0F0F0F0F) | (((qh0 >> hs) & 0x01010101) << 4);
+        w.v1i[i] = ((v1 >> (4 * i)) & 0x0F0F0F0F) | (((qh1 >> hs) & 0x01010101) << 4);
+    }
+    const float2 dm5f = __half22float2(bq5->dm);
+    w.d = dm5f.x; w.dmin = dm5f.y;
+    return w;
+}
+// si_vec_dot_q5_K(b, a, iqs) == si_vec_dot_q5_K_wa(si_q5k_decode_w(b, iqs), si_q8a_load(a, iqs)).
+__device__ __forceinline__ float si_vec_dot_q5_K_wa(const si_q5k_wdec& w, const si_q8a& a) {
+    float sumf_d = 0.f, sumf_m = 0.f;
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int dot1 = __dp4a(w.v0i[i], a.u[2 * i], __dp4a(w.v1i[i], a.u[2 * i + 1], 0));
+        const int dot2 = __dp4a(0x01010101, a.u[2 * i], __dp4a(0x01010101, a.u[2 * i + 1], 0));
+        sumf_d += a.d8[i] * (dot1 * w.sc[i]);
+        sumf_m += a.d8[i] * (dot2 * w.m[i]);
+    }
+    return w.d * sumf_d - w.dmin * sumf_m;
+}
+template <int H, int F, int TOPK, int WARPS, int R>
+__global__ void __launch_bounds__(WARPS * 32) down_q5k_group_qwen_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const si_block_q8_1* __restrict__ hq8, float* __restrict__ dpart, const int* __restrict__ perm,
+    const int* __restrict__ seg, const int* __restrict__ nseg) {
+    static_assert(F == 512, "one Q5_K word pair a lane: F / 256 super-blocks x 16 positions = 32");
+    constexpr int FB = H / R;
+    constexpr int NB = F >> 8, Q8PB = F >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n_tasks = *nseg * FB;
+    for (int g = blockIdx.x * WARPS + (int)(threadIdx.x >> 5); g < n_tasks; g += gridDim.x * WARPS) {
+    const int s = g / FB;
+    const int h0 = (g - s * FB) * R;
+    const int lo = seg[s], hi = seg[s + 1];
+    const int e = expert_ids[perm[lo]];
+    const int kbx = lane >> 4, kqs = (lane & 15) << 1;
+    si_q5k_wdec w[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        w[r] = si_q5k_decode_w(reinterpret_cast<const si_block_q5_K*>(
+                   down_q + ((size_t)e * H + h0 + r) * NB * 176) + kbx, kqs);
+    for (int i = lo; i < hi; ++i) {
+        const int ts = perm[i];
+        const si_q8a a = si_q8a_load(hq8 + (size_t)ts * Q8PB + (size_t)kbx * 8, kqs);
+        float t[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) t[r] = si_vec_dot_q5_K_wa(w[r], a);
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) t[r] += __shfl_xor_sync(0xffffffffu, t[r], m);
+        if (lane < R) {
+            float v = t[0];
+#pragma unroll
+            for (int r = 1; r < R; ++r) if (lane == r) v = t[r];
+            dpart[(size_t)ts * H + h0 + lane] = v;
+        }
+    }
+    }
+}
+// down_q5k_group_qwen_kernel for a Q4_K down (the expert pool refit at load, see
+// SPARKINFER_MOE_DOWN_REQUANT_Q4K in qwen35.cpp): the same expert-grouped walk and dpart output,
+// with the Q4_K lane decode the grouped gate/up uses (si_q4k_decode_w + si_vec_dot_q4_K_wa).
+template <int H, int F, int TOPK, int WARPS, int R>
+__global__ void __launch_bounds__(WARPS * 32) down_q4k_group_qwen_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const si_block_q8_1* __restrict__ hq8, float* __restrict__ dpart, const int* __restrict__ perm,
+    const int* __restrict__ seg, const int* __restrict__ nseg) {
+    static_assert(F == 512, "one Q4_K word pair a lane: F / 256 super-blocks x 16 positions = 32");
+    constexpr int FB = H / R;
+    constexpr int NB = F >> 8, Q8PB = F >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n_tasks = *nseg * FB;
+    for (int g = blockIdx.x * WARPS + (int)(threadIdx.x >> 5); g < n_tasks; g += gridDim.x * WARPS) {
+    const int s = g / FB;
+    const int h0 = (g - s * FB) * R;
+    const int lo = seg[s], hi = seg[s + 1];
+    const int e = expert_ids[perm[lo]];
+    const int kbx = lane >> 4, kqs = (lane & 15) << 1;
+    si_q4k_wdec w[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        w[r] = si_q4k_decode_w(reinterpret_cast<const si_block_q4_K*>(
+                   down_q + ((size_t)e * H + h0 + r) * NB * 144) + kbx, kqs);
+    for (int i = lo; i < hi; ++i) {
+        const int ts = perm[i];
+        const si_q8a a = si_q8a_load(hq8 + (size_t)ts * Q8PB + (size_t)kbx * 8, kqs);
+        float t[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) t[r] = si_vec_dot_q4_K_wa(w[r], a);
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) t[r] += __shfl_xor_sync(0xffffffffu, t[r], m);
+        if (lane < R) {
+            float v = t[0];
+#pragma unroll
+            for (int r = 1; r < R; ++r) if (lane == r) v = t[r];
+            dpart[(size_t)ts * H + h0 + lane] = v;
+        }
+    }
+    }
+}
+
+// output[token][hh] = sum over slots j in order of expert_weights[token, j] * dpart[(token, j)][hh].
+template <int TOPK>
+__global__ void moe_down_combine_kernel(const float* __restrict__ dpart, const float* __restrict__ expert_weights,
+                                        __nv_bfloat16* __restrict__ output, int H, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int token = i / H, hh = i - token * H;
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < TOPK; ++j)
+        acc += expert_weights[token * TOPK + j] * dpart[(size_t)(token * TOPK + j) * H + hh];
+    output[i] = __float2bfloat16(acc);
+}
+
+// Q5_K ffn_down for a packed batch of a dense FFN (top_k == 1): one warp per hidden column, the
+// row loop inside, so each column's weights are read once per chunk of up to MM rows instead of once
+// per row (the split-K kernel below puts the token on grid.x: 16 rows re-read a 61 MB matrix 16x).
+template <int MM>
+__global__ void down_q5k_mmvq_rows_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const si_block_q8_1* __restrict__ hq8,
+    __nv_bfloat16* __restrict__ output, int H, int F, int m, int pdl
+) {
+    if (pdl) si_pdl_sync();
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int hh = blockIdx.x * WPB + warpId;
+    if (hh >= H) return;
+    const int nblk = F >> 8, q8pb = F >> 5, work = nblk * 16;
+    float acc[MM];
+#pragma unroll
+    for (int r = 0; r < MM; ++r) acc[r] = 0.f;
+    for (int wi = lane; wi < work; wi += 32) {
+        const int kbx = wi >> 4, kqs = (wi & 15) << 1;
+#pragma unroll
+        for (int r = 0; r < MM; ++r)
+            if (r < m) {
+                const si_block_q5_K* drow = reinterpret_cast<const si_block_q5_K*>(
+                    down_q + ((size_t)expert_ids[r] * H + hh) * nblk * 176);
+                acc[r] += si_vec_dot_q5_K(drow + kbx, hq8 + (size_t)r * q8pb + (size_t)kbx * 8, kqs);
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < MM; ++r) {
+        if (r >= m) break;
+        float a = acc[r];
+#pragma unroll
+        for (int k = 16; k > 0; k >>= 1) a += __shfl_xor_sync(0xffffffffu, a, k);
+        if (lane == 0) output[(size_t)r * H + hh] = __float2bfloat16(expert_weights[r] * a);
+    }
+}
+
 template <int S, int WPBK = WPB>
 __global__ void down_q5k_mmvq_splitk_kernel(
     const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
@@ -1904,6 +2442,45 @@ static inline int down_batch_warps() {
     return v;
 }
 
+// SPARKINFER_MOE_GU_ROWS: f rows per warp for the batched Qwen3.6 gate/up when it is not grouped by
+// expert (2 / 4 / 8; 1 = the one-row kernel). SPARKINFER_MOE_GU_ROWS_MIN (default 20) is the row
+// count from which the sorted, grouped path runs at all: below it few pairs share an expert, and
+// the sort and the down's combine pass cost more than the shared weight reads save (c4 -3%, c16
+// even, c20 +4%, c32 +11% in cb_bench).
+static inline int gu_rows_r() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MOE_GU_ROWS");
+        const int x = e ? atoi(e) : 4;
+        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4;
+    }();
+    return v;
+}
+// SPARKINFER_MOE_GU_SORT=0 keeps the batched gate/up in token order (see moe_pair_sort_kernel).
+static inline int gu_sort() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MOE_GU_SORT");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    return v;
+}
+// SPARKINFER_MOE_GU_GROUP: pairs per pass of the expert-grouped gate/up (2 / 4 / 8; 0 = the
+// R-rows kernel in sorted order instead).
+static inline int gu_group() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MOE_GU_GROUP");
+        const int x = e ? atoi(e) : 4;
+        return (x == 0 || x == 2 || x == 4 || x == 8) ? x : 4;
+    }();
+    return v;
+}
+static inline int gu_rows_min() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_MOE_GU_ROWS_MIN");
+        return e ? atoi(e) : 20;
+    }();
+    return v;
+}
+
 template <int H, int F, int TOPK, typename... Args>
 static inline void launch_gate_up_warp_qwen(int warps, int pdl, int n_rows, cudaStream_t stream,
                                             Args... args) {
@@ -2113,7 +2690,10 @@ template <int MM, int CG> struct si_mma_lb {
     static constexpr int v = occ > 8 ? 8 : occ;
 };
 
-template <int MM, int CG = 1>
+// QT = 13 reads Q5_K: the same dm and 6-bit scale/min layout, the same nibble order, plus one high
+// bit per weight from qh[32] (low nibbles of 64-group j take bit 2j, high nibbles bit 2j+1, as in
+// ggml's dequantize_row_q5_K). Values 0..31 still fit the int8 operand, so only the loader changes.
+template <int MM, int CG = 1, int QT = 12>
 __global__ __launch_bounds__(SI_MMA_NW * 32, si_mma_lb<MM, CG>::v)
 void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
                               const int* __restrict__ expert_ids,
@@ -2170,27 +2750,39 @@ void down_q4k_mma_rows_kernel(const unsigned char* __restrict__ down_q,
             // once, from the identical addresses, the high ones. Eight units, one fetch, two stores:
             // the same bytes reach the same shared addresses and the global load count halves.
             // Bit-identical. SPARKINFER_MMA_BDEDUP=0 restores the two-pass loader.
-            if (bdedup) {
+            if (bdedup || QT == 13) {
+                constexpr int BB = QT == 13 ? 176 : 144;      // super-block bytes
+                constexpr int QO = QT == 13 ? 48 : 16;        // offset of qs
                 for (int u = tid; u < SI_MMA_BN * 8; u += SI_MMA_NW * 32) {
                     const int r = u >> 3, c = u & 7;
-                    const si_block_q4_K* b = reinterpret_cast<const si_block_q4_K*>(
-                        down_q + ((size_t)e0 * H + (nbase + r)) * (size_t)nblk * 144) + sb;
+                    const unsigned char* bb = down_q + ((size_t)e0 * H + (nbase + r)) * (size_t)nblk * BB +
+                                              (size_t)sb * BB;
                     const int j = c >> 1, h = c & 1;
                     // The 16 B chunk is one aligned word: a Q4_K block is 144 B, so qs + 32j + 16h sits on a
                     // 16 B boundary of any 16 B-aligned weight (every cudaMalloc base is 256 B aligned). One
                     // uint4 load and a mask/shift per component replace four 4 B loads and the per-byte split
                     // -- the same nibbles to the same shared addresses. Bit-identical.
-                    const uint4 nib = *reinterpret_cast<const uint4*>(b->qs + 32 * j + h * 16);
+                    const uint4 nib = *reinterpret_cast<const uint4*>(bb + QO + 32 * j + h * 16);
                     const unsigned m4 = 0x0f0f0f0fu;
                     uint4 lo, hi;
                     lo.x = nib.x & m4;        lo.y = nib.y & m4;        lo.z = nib.z & m4;        lo.w = nib.w & m4;
                     hi.x = (nib.x >> 4) & m4; hi.y = (nib.y >> 4) & m4; hi.z = (nib.z >> 4) & m4; hi.w = (nib.w >> 4) & m4;
+                    if constexpr (QT == 13) {
+                        // qh byte l carries bit 2j (value l of the low half) and 2j+1 (value l+32).
+                        const uint4 qh = *reinterpret_cast<const uint4*>(bb + 16 + h * 16);
+                        const unsigned b1 = 0x01010101u;
+                        const int s0 = 2 * j, s1 = 2 * j + 1;
+                        lo.x |= ((qh.x >> s0) & b1) << 4; lo.y |= ((qh.y >> s0) & b1) << 4;
+                        lo.z |= ((qh.z >> s0) & b1) << 4; lo.w |= ((qh.w >> s0) & b1) << 4;
+                        hi.x |= ((qh.x >> s1) & b1) << 4; hi.y |= ((qh.y >> s1) & b1) << 4;
+                        hi.z |= ((qh.z >> s1) & b1) << 4; hi.w |= ((qh.w >> s1) & b1) << 4;
+                    }
                     const int kb = 64 * j + h * 16;
                     *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb, r)]) = lo;
                     *reinterpret_cast<uint4*>(&Bs[r][si_mma_swz(kb + 32, r)]) = hi;
                     if (c == 0) {
-                        Wdm[r] = __half22float2(b->dm);
-                        si_mma_q4k_scales8(b->scales, Ssc[r], Smn[r]);
+                        Wdm[r] = __half22float2(*reinterpret_cast<const __half2*>(bb));
+                        si_mma_q4k_scales8(bb + 4, Ssc[r], Smn[r]);
                     }
                 }
             } else {
@@ -2396,8 +2988,9 @@ static inline int si_mma_astage(int M) {
 static inline bool launch_down_q4k_mma_rows(
     int pdl, const unsigned char* down_q, const int* expert_ids, const float* expert_weights,
     const si_block_q8_1* hq8, __nv_bfloat16* output,
-    int H, int F, int top_k, int M, cudaStream_t stream
+    int H, int F, int top_k, int M, cudaStream_t stream, int qt = 12
 ) {
+    if (qt != 12 && qt != 13) return false;
     if (M < 2 || M > SI_MMA_MMAX || top_k != 1 || (F & 255) || (H % SI_MMA_BN)) return false;
     if ((size_t)M * (size_t)H > (size_t)SI_MMA_MMAX * 6656u) return false;
     const int slot = si_mma_down_slot_for(stream);
@@ -2423,8 +3016,12 @@ static inline bool launch_down_q4k_mma_rows(
     const int bd = si_mma_bdedup();
     const int as = si_mma_astage(M);
 #define SI_MMA_DOWN_LAUNCH(MMV, CGV)                                                              \
+    do { if (qt == 13)                                                                            \
+    launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<MMV, CGV, 13>, down_q,      \
+                      expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd);      \
+    else                                                                                          \
     launch_pdl_kernel(pdl, g, blk, 0, stream, down_q4k_mma_rows_kernel<MMV, CGV>, down_q,          \
-                      expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd)
+                      expert_ids, expert_weights, hq8, acc_scratch, H, F, top_k, M, pdl, bd); } while (0)
 #define SI_MMA_DOWN_BY_CG(MMV)                                                                    \
     do { if (cg == 4) SI_MMA_DOWN_LAUNCH(MMV, 4);                                                 \
          else if (cg == 2) SI_MMA_DOWN_LAUNCH(MMV, 2);                                            \
@@ -2461,9 +3058,10 @@ __global__ void gate_up_mma_swiglu_kernel(const float* __restrict__ acc_g, float
 static inline bool launch_gate_up_q4k_mma_rows(
     const unsigned char* gate_q, const unsigned char* up_q, const int* expert_ids,
     const float* expert_weights, const si_block_q8_1* xq8, float* acc_g, float* h,
-    int H, int F, int M, cudaStream_t stream
+    int H, int F, int M, cudaStream_t stream, int gt = 12, int ut = 12
 ) {
     if (M < 2 || M > SI_MMA_MMAX || !acc_g || !h || (H & 255) || (F % SI_MMA_BN)) return false;
+    if ((gt != 12 && gt != 13) || (ut != 12 && ut != 13)) return false;
     const size_t n = (size_t)M * F;
     if (cudaMemsetAsync(acc_g, 0, n * sizeof(float), stream) != cudaSuccess ||
         cudaMemsetAsync(h, 0, n * sizeof(float), stream) != cudaSuccess)
@@ -2475,20 +3073,22 @@ static inline bool launch_gate_up_q4k_mma_rows(
     const dim3 g(F / SI_MMA_BN, sk), blk(SI_MMA_NW * 32);
     const int bd = si_mma_bdedup();
     const int as = si_mma_astage(M);
-#define SI_GU_MMA(W_, ACC_) do { \
+#define SI_GU_MMA_T(W_, ACC_, T_) do { \
         if (as <= 8) \
-            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<8>, W_, expert_ids, \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<8, 1, T_>, W_, expert_ids, \
                               expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
         else if (as <= 16) \
-            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<16>, W_, expert_ids, \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<16, 1, T_>, W_, expert_ids, \
                               expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
         else \
-            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, W_, \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX, 1, T_>, W_, \
                               expert_ids, expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
     } while (0)
-    SI_GU_MMA(gate_q, acc_g);
-    SI_GU_MMA(up_q, h);
+#define SI_GU_MMA(W_, ACC_, QT_) do { if (QT_ == 13) SI_GU_MMA_T(W_, ACC_, 13); else SI_GU_MMA_T(W_, ACC_, 12); } while (0)
+    SI_GU_MMA(gate_q, acc_g, gt);
+    SI_GU_MMA(up_q, h, ut);
 #undef SI_GU_MMA
+#undef SI_GU_MMA_T
     gate_up_mma_swiglu_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(acc_g, h, n);
     return true;
 }
@@ -2991,10 +3591,16 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+    static const bool gu_kq_mixed = [] {
+        const char* e = getenv("SPARKINFER_GU_KQ_MIXED");
+        return !(e && e[0] == '0');
+    }();
     const int gu_pdl = gu_mmvq_pdl();
     // Whether the gate/up launch is programmatic, so the quantize that follows it may chain on it.
     // The tensor-core gate/up below is launched plainly and clears it.
     int gu_chain = gu_pdl;
+    // set when this call's routed pairs were sorted by expert (moe_pair_sort_kernel); the grouped down reuses them
+    SiMoeSlot* moe_slot = nullptr;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     // With the projections supplied, the int8 down arms below read only Q8_1(h), never h itself,
     // so when one of them follows, the SwiGLU is folded into that quantize and h is never written
@@ -3108,6 +3714,44 @@ void launch_moe_expert_ffn_q4k(
                 launch_pdl_kernel(gu_pdl, dim3(num_tokens * top_k * ffn), dim3(4 * 32), 0, stream, gate_up_q3a_kernel,
                     q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
                     hidden, ffn, top_k, gu_pdl);
+        } else if (num_tokens > 1 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8 &&
+                   gu_rows_r() > 1 && num_tokens >= gu_rows_min()) {
+            // A wide batch: the routed pairs sorted by expert (moe_pair_sort_kernel), then the
+            // expert-grouped gate/up (gate_up_mmvq2_group_qwen_kernel), or with
+            // SPARKINFER_MOE_GU_GROUP=0 R f rows a warp in sorted order. Both bit-identical to the
+            // one-row arm below; the Q5_K down then groups by expert over the same sort.
+            const int n_groups = num_tokens * top_k * ffn / gu_rows_r();
+            const dim3 g((n_groups + 3) / 4), b(4 * 32);
+            const auto* gq = reinterpret_cast<const unsigned char*>(gate_q);
+            const auto* uq = reinterpret_cast<const unsigned char*>(up_q);
+            const int n_pairs = num_tokens * top_k;
+            int* perm = nullptr;
+            int* seg = nullptr;
+            if (gu_sort() && n_pairs <= SI_MOE_PERM_MAX && (moe_slot = moe_slot_for(stream)) != nullptr) {
+                perm = moe_slot->perm;
+                seg = moe_slot->seg;
+                moe_pair_sort_kernel<<<1, 256, 0, stream>>>(expert_ids, n_pairs, perm, seg, seg + SI_MOE_PERM_MAX + 1,
+                                                            moe_slot->segc, moe_slot->segc + SI_MOE_PERM_MAX + 1);
+            }
+            if (perm && gu_group() > 0) {
+                // one warp per (expert chunk, R rows); sized for every pair its own chunk
+                const int* sc = moe_slot->segc;
+                const int* ns = sc + SI_MOE_PERM_MAX + 1;
+                constexpr int R = 4, W = 4;
+                const dim3 gg((n_pairs * (512 / R) + W - 1) / W), bb(W * 32);
+                if (gu_group() == 2)
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 2><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
+                else if (gu_group() == 8)
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 8><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
+                else
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 4><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
+            } else if (gu_rows_r() == 2)
+                gate_up_mmvq2_warp_rows_qwen_kernel<2048, 512, 8, 4, 2><<<g, b, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, n_groups, perm);
+            else if (gu_rows_r() == 8)
+                gate_up_mmvq2_warp_rows_qwen_kernel<2048, 512, 8, 4, 8><<<g, b, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, n_groups, perm);
+            else
+                gate_up_mmvq2_warp_rows_qwen_kernel<2048, 512, 8, 4, 4><<<g, b, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, n_groups, perm);
+            gu_chain = 0;
         } else if (num_tokens > 1 && gu_warps > 0 && gu_spec && hidden == 2048 && ffn == 512 && top_k == 8) {
             const int n_rows = num_tokens * top_k * ffn;
             launch_gate_up_warp_qwen<2048, 512, 8>(gu_warps, gu_pdl, n_rows, stream,
@@ -3236,6 +3880,73 @@ void launch_moe_expert_ffn_q4k(
                 q, reinterpret_cast<const unsigned char*>(gate_q),
                 reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch,
                 hidden, ffn, top_k, gu_pdl);
+    } else if (mmvq && gu2 && gu_kq_mixed && (hidden & 255) == 0 &&
+               (gate_type == 12 || gate_type == 13 || gate_type == 14) &&
+               (up_type == 12 || up_type == 13 || up_type == 14)) {
+        // A mixed k-quant pair (Q4_K/Q5_K/Q6_K, not both Q4_K): int8 mmvq instead of the fp
+        // fallback below. SPARKINFER_GU_KQ_MIXED=0 restores the fallback.
+        const si_block_q8_1* q;
+        if (input_q8) {
+            q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else {
+            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(out_scratch);
+            const int nqb = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
+            q = qbuf;
+        }
+        const dim3 grid(num_tokens * top_k * ffn), block(4 * 32);
+        const auto* gq = reinterpret_cast<const unsigned char*>(gate_q);
+        const auto* uq = reinterpret_cast<const unsigned char*>(up_q);
+        // A dense packed batch reads each weight once per 16 rows (SPARKINFER_GU_KQ_ROWS=0: per row).
+        static const bool gu_kq_rows = [] {
+            const char* e = getenv("SPARKINFER_GU_KQ_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        const bool kq_rows = gu_kq_rows && top_k == 1 && num_tokens >= 2;
+        // Wide batches with Q4_K/Q5_K gate and up go to the tensor cores, as the Q4_K pair does
+        // (same SPARKINFER_GU_MMA_MINROWS floor). Q6_K has no tensor-core loader; it stays below.
+        static const int kq_mma_min = [] {
+            const char* e = getenv("SPARKINFER_GU_MMA_MINROWS");
+            return e ? atoi(e) : 8;
+        }();
+        const bool kq_mma = gate_acc && kq_mma_min > 0 && num_tokens >= kq_mma_min && top_k == 1 &&
+            gate_type != 14 && up_type != 14 &&
+            launch_gate_up_q4k_mma_rows(reinterpret_cast<const unsigned char*>(gate_q),
+                                        reinterpret_cast<const unsigned char*>(up_q), expert_ids,
+                                        expert_weights, q, gate_acc, h_scratch, hidden, ffn,
+                                        num_tokens, stream, gate_type, up_type);
+        if (kq_mma) gu_chain = 0;
+#define SI_GU_KQR(G_, U_) do {                                                                     \
+            for (int t0 = 0; t0 < num_tokens; t0 += 16) {                                           \
+                const int m = (num_tokens - t0) < 16 ? (num_tokens - t0) : 16;                       \
+                const si_block_q8_1* qr = q + (size_t)t0 * (hidden >> 5);                            \
+                float* hr = h_scratch + (size_t)t0 * ffn;                                            \
+                const int* er = expert_ids + t0;                                                     \
+                if (m <= 8) launch_pdl_kernel(gu_pdl, dim3(ffn), block, 0, stream,                   \
+                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 8>, qr, gq, uq, er, hr,          \
+                                hidden, ffn, m, gu_pdl);                                             \
+                else        launch_pdl_kernel(gu_pdl, dim3(ffn), block, 0, stream,                   \
+                                gate_up_mmvq2_kq_rows_kernel<G_, U_, 16>, qr, gq, uq, er, hr,        \
+                                hidden, ffn, m, gu_pdl);                                             \
+            }                                                                                        \
+        } while (0)
+#define SI_GU_KQ(G_, U_) do { if (kq_rows) SI_GU_KQR(G_, U_); else                                \
+            launch_pdl_kernel(gu_pdl, grid, block, 0, stream, gate_up_mmvq2_kq_kernel<G_, U_>,         \
+            q, gq, uq, expert_ids, h_scratch, hidden, ffn, top_k, gu_pdl); } while (0)
+        if (!kq_mma) switch (gate_type * 16 + up_type) {
+            case 12 * 16 + 13: SI_GU_KQ(12, 13); break;
+            case 12 * 16 + 14: SI_GU_KQ(12, 14); break;
+            case 13 * 16 + 12: SI_GU_KQ(13, 12); break;
+            case 13 * 16 + 13: SI_GU_KQ(13, 13); break;
+            case 13 * 16 + 14: SI_GU_KQ(13, 14); break;
+            case 14 * 16 + 12: SI_GU_KQ(14, 12); break;
+            case 14 * 16 + 13: SI_GU_KQ(14, 13); break;
+            case 14 * 16 + 14: SI_GU_KQ(14, 14); break;
+            default:           SI_GU_KQ(12, 12); break;   // unreachable: Q4_K/Q4_K takes the arm above
+        }
+#undef SI_GU_KQ
+#undef SI_GU_KQR
     } else if (mmvq && gate_type == 12 && up_type == 12) {   // 12 = ggml Q4_K
         size_t sm = 2 * (size_t)(hidden >> 5) * sizeof(float) + (size_t)hidden;  // s_xd+s_xs+s_xq8
         launch_pdl_kernel(gu_pdl, gu, dim3(WPB * 32), sm, stream, gate_up_q4k_mmvq_kernel,
@@ -3308,6 +4019,25 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        // Qwen3.6's routed down refit to Q4_K: by expert over the gate/up's sort, as the Q5_K one
+        // (and off with it: SPARKINFER_MOE_DOWN_GROUP=0).
+        static const bool q4_group = [] {
+            const char* e = getenv("SPARKINFER_MOE_DOWN_GROUP");
+            return !(e && e[0] == '0');
+        }();
+        if (q4_group && moe_slot && !ar_exact_splitk && top_k == 8 && hidden == 2048 && ffn == 512 &&
+            num_tokens * top_k <= SI_MOE_PERM_MAX) {
+            constexpr int R = 4, W = 4;
+            const int n_pairs = num_tokens * top_k;
+            const dim3 gg((n_pairs * (2048 / R) + W - 1) / W), bb(W * 32);
+            down_q4k_group_qwen_kernel<2048, 512, 8, W, R><<<gg, bb, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, hq8, moe_slot->dpart,
+                moe_slot->perm, moe_slot->seg, moe_slot->seg + SI_MOE_PERM_MAX + 1);
+            const int n = num_tokens * hidden;
+            moe_down_combine_kernel<8><<<(n + 255) / 256, 256, 0, stream>>>(
+                moe_slot->dpart, expert_weights, reinterpret_cast<__nv_bfloat16*>(output), hidden, n);
+            return;
+        }
         int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         // The split-K factor was fitted at ONE row, where splitting hides a bs=1 occupancy stall.
         // A packed batch already gives every block M rows of work, so the extra splits buy
@@ -3450,6 +4180,61 @@ void launch_moe_expert_ffn_q4k(
         // that reproduction passes ar_exact_splitk and gets AR's split count for any num_tokens;
         // with S pinned the kernel's grid is dim3(num_tokens, ...), one block column per token, so
         // every row's arithmetic is identical to the num_tokens == 1 call.
+        // A dense packed batch: one read of ffn_down per 16 rows. SPARKINFER_DOWN_Q5K_ROWS=0 keeps
+        // the per-row split-K below. Not for ar_exact_splitk callers, which need AR's split order.
+        static const bool q5k_rows = [] {
+            const char* e = getenv("SPARKINFER_DOWN_Q5K_ROWS");
+            return !(e && e[0] == '0');
+        }();
+        // Wide batches: the tensor-core down, as for Q4_K (SPARKINFER_DOWN_MMA / _MINROWS).
+        static const int q5_mma = [] { const char* e = getenv("SPARKINFER_DOWN_MMA"); return (e && e[0] == '0') ? 0 : 1; }();
+        static const int q5_mma_min_env = [] { const char* e = getenv("SPARKINFER_DOWN_MMA_MINROWS"); return e ? atoi(e) : -1; }();
+        const int q5_mma_min = q5_mma_min_env >= 0 ? q5_mma_min_env : (down_mma_min_rows > 0 ? down_mma_min_rows : 8);
+        if (q5_mma && !ar_exact_splitk && num_tokens >= q5_mma_min && top_k == 1 &&
+            launch_down_q4k_mma_rows(pdl, reinterpret_cast<const unsigned char*>(down_q),
+                                     expert_ids, expert_weights, hq8,
+                                     reinterpret_cast<__nv_bfloat16*>(output),
+                                     hidden, ffn, top_k, num_tokens, stream, 13))
+            return;
+        if (q5k_rows && !ar_exact_splitk && top_k == 1 && num_tokens >= 2) {
+            const dim3 g((hidden + WPB - 1) / WPB), b(WPB * 32);
+            for (int t0 = 0; t0 < num_tokens; t0 += 16) {
+                const int m = (num_tokens - t0) < 16 ? (num_tokens - t0) : 16;
+                const si_block_q8_1* hr = hq8 + (size_t)t0 * (ffn >> 5);
+                __nv_bfloat16* outr = reinterpret_cast<__nv_bfloat16*>(output) + (size_t)t0 * hidden;
+                const int* er = expert_ids + t0;
+                const float* wr = expert_weights + t0;
+                if (m <= 8)
+                    launch_mmvq_down_kernel(pdl, g, b, stream, down_q5k_mmvq_rows_kernel<8>,
+                        reinterpret_cast<const unsigned char*>(down_q), er, wr, hr, outr, hidden, ffn, m, pdl);
+                else
+                    launch_mmvq_down_kernel(pdl, g, b, stream, down_q5k_mmvq_rows_kernel<16>,
+                        reinterpret_cast<const unsigned char*>(down_q), er, wr, hr, outr, hidden, ffn, m, pdl);
+            }
+            return;
+        }
+        // Qwen3.6's routed down, batched: by expert, over the pairs the gate/up sorted
+        // (down_q5k_group_qwen_kernel). SPARKINFER_MOE_DOWN_GROUP=0 keeps the per-token kernel.
+        static const bool q5_group = [] {
+            const char* e = getenv("SPARKINFER_MOE_DOWN_GROUP");
+            return !(e && e[0] == '0');
+        }();
+        if (q5_group && moe_slot && !ar_exact_splitk && top_k == 8 && hidden == 2048 && ffn == 512 &&
+            num_tokens * top_k <= SI_MOE_PERM_MAX) {
+            float* dpart = moe_slot->dpart;
+            const int* moe_perm = moe_slot->perm;
+            const int* moe_seg = moe_slot->seg;
+            constexpr int R = 4, W = 4;
+            const int n_pairs = num_tokens * top_k;
+            const dim3 gg((n_pairs * (2048 / R) + W - 1) / W), bb(W * 32);
+            down_q5k_group_qwen_kernel<2048, 512, 8, W, R><<<gg, bb, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, hq8, dpart, moe_perm, moe_seg,
+                moe_seg + SI_MOE_PERM_MAX + 1);
+            const int n = num_tokens * hidden;
+            moe_down_combine_kernel<8><<<(n + 255) / 256, 256, 0, stream>>>(
+                dpart, expert_weights, reinterpret_cast<__nv_bfloat16*>(output), hidden, n);
+            return;
+        }
         const char* s5env = getenv("SPARKINFER_DOWN_SPLITK_S_Q5");
         const int Sbase = (num_tokens > 1 && !s5env && !ar_exact_splitk) ? 1 : down_splitk_s_q5();
         const int S = dense_top1_down_splitk(Sbase, top_k, "SPARKINFER_DOWN_SPLITK_S_Q5");
@@ -3537,13 +4322,209 @@ void launch_shared_expert_q8_mmvq(
     }
 }
 
+// ---- The Q8_0 shared expert on the int8 tensor cores, for a packed step's 16-32 rows ----
+// The rows kernels above give each thread one Q8_0 block and walk every row's activation block
+// past it, one dot after another: at 32 rows that is a chain of 64 dependent L1/L2 loads per
+// thread, and the shared expert -- 3.3 MB of weights a layer -- took ~110 us of a Qwen3.6 layer
+// (4.4 ms of GPU time in a 14.4 ms 32-row step), stealing SMs from the routed experts it runs
+// beside. Here m16n8k32 takes 16 rows x 8 outputs x one whole Q8_0 block per instruction: the
+// int32 block dot is exact, as the dp4a one is, and d_w * d_a folds in per block in fp32. Only the
+// fp32 summation order across blocks differs from the rows kernels, so this is gated to wide
+// steps (SPARKINFER_SHEXP_MMA=0 keeps them).
+//
+// One warp owns 8 output columns for every row and a K range; gate/up split K so the 1024-column
+// pair fills the GPU, and write fixed per-split slots that shexp_q8_gu_reduce_kernel sums in
+// split order -- deterministic, no atomics. Down (K = 512) runs unsplit and writes bf16.
+constexpr int SHEXP_MMA_SPLITS = 8;
+constexpr int SHEXP_MMA_MMAX = 32;
+// Per-split gate/up partials. Static, like si_am_acc: decode captures CUDA graphs and a cudaMalloc
+// reached during capture would invalidate them. The shared expert has one call site, on one stream
+// per step, so one buffer is never in use twice at once.
+__device__ float si_shexp_part[SHEXP_MMA_SPLITS * SHEXP_MMA_MMAX * 1024];
+
+template <int MT>
+__global__ __launch_bounds__(128) void shexp_q8_mma_kernel(
+    const si_block_q8_1* __restrict__ act, int K,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ W1, int N0,
+    int M, int N, float* __restrict__ part, __nv_bfloat16* __restrict__ out) {
+    const int nblk = K >> 5;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 8;
+    if (n0 >= N) return;
+    const int S = (int)gridDim.y, sp = (int)blockIdx.y;
+    const int kb_lo = (nblk * sp) / S, kb_hi = (nblk * (sp + 1)) / S;
+    auto wrow = [&](int n) {
+        return n < N0 ? W0 + (size_t)n * nblk * 34 : W1 + (size_t)(n - N0) * nblk * 34;
+    };
+    const unsigned char* wb = wrow(n0 + grp);            // this lane's B-fragment column
+    const unsigned char* wc0 = wrow(n0 + tig * 2);       // its two accumulator columns
+    const unsigned char* wc1 = wrow(n0 + tig * 2 + 1);
+    float acc[MT][4];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    for (int kb = kb_lo; kb < kb_hi; ++kb) {
+        const unsigned char* qw = wb + (size_t)kb * 34 + 2;
+        const unsigned b0 = (unsigned)si_ld4(qw + tig * 4), b1 = (unsigned)si_ld4(qw + 16 + tig * 4);
+        const float dw0 = q4kf_h2f(wc0 + (size_t)kb * 34), dw1 = q4kf_h2f(wc1 + (size_t)kb * 34);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            const int ra = t * 16 + grp, rb = ra + 8;
+            unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            float da = 0.f, db = 0.f;
+            if (ra < M) {
+                const si_block_q8_1* x = act + (size_t)ra * nblk + kb;
+                a0 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                a2 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                da = __low2float(x->ds);
+            }
+            if (rb < M) {
+                const si_block_q8_1* x = act + (size_t)rb * nblk + kb;
+                a1 = *reinterpret_cast<const unsigned*>(x->qs + tig * 4);
+                a3 = *reinterpret_cast<const unsigned*>(x->qs + 16 + tig * 4);
+                db = __low2float(x->ds);
+            }
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, "
+                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                         : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            acc[t][0] += (float)c0 * (da * dw0);
+            acc[t][1] += (float)c1 * (da * dw1);
+            acc[t][2] += (float)c2 * (db * dw0);
+            acc[t][3] += (float)c3 * (db * dw1);
+        }
+    }
+    const int c = n0 + tig * 2;
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        const int ra = t * 16 + grp, rb = ra + 8;
+        if (part) {
+            float* pp = part + (size_t)sp * M * N;
+            if (ra < M) { pp[(size_t)ra * N + c] = acc[t][0]; pp[(size_t)ra * N + c + 1] = acc[t][1]; }
+            if (rb < M) { pp[(size_t)rb * N + c] = acc[t][2]; pp[(size_t)rb * N + c + 1] = acc[t][3]; }
+        } else {
+            if (ra < M) {
+                out[(size_t)ra * N + c] = __float2bfloat16(acc[t][0]);
+                out[(size_t)ra * N + c + 1] = __float2bfloat16(acc[t][1]);
+            }
+            if (rb < M) {
+                out[(size_t)rb * N + c] = __float2bfloat16(acc[t][2]);
+                out[(size_t)rb * N + c + 1] = __float2bfloat16(acc[t][3]);
+            }
+        }
+    }
+}
+
+// Sums the gate/up splits in split order and applies the same dw * silu(g) * u the rows kernel
+// writes, into the same h_scratch layout, so the quantize and down that follow are unchanged.
+__global__ void shexp_q8_gu_reduce_kernel(const float* __restrict__ part, int S, int M, int F,
+                                          const float* __restrict__ dw, float* __restrict__ h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M * F) return;
+    const int r = i / F, f = i - r * F, N = 2 * F;
+    float g = 0.f, u = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float* pp = part + ((size_t)s * M + r) * N;
+        g += pp[f];
+        u += pp[F + f];
+    }
+    h[(size_t)r * F + f] = __ldg(dw + r) * q4kf_silu(g) * u;
+}
+
+// The 2048 / 512 shared expert at 9-32 rows on the tensor cores; false (nothing launched) when the
+// arm is off or the shape is not the one it was written for.
+static bool launch_shared_expert_q8_mma(const si_block_q8_1* q, const void* gate_q, const void* up_q,
+                                        const void* down_q, const float* dw, __nv_bfloat16* out,
+                                        float* h_scratch, si_block_q8_1* hq, int hidden, int ffn,
+                                        int rows, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_MMA");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || hidden != 2048 || ffn != 512 || rows < 9 || rows > SHEXP_MMA_MMAX) return false;
+    float* part = nullptr;
+    if (cudaGetSymbolAddress(reinterpret_cast<void**>(&part), si_shexp_part) != cudaSuccess)
+        return false;
+    const auto* g = reinterpret_cast<const unsigned char*>(gate_q);
+    const auto* u = reinterpret_cast<const unsigned char*>(up_q);
+    const auto* d = reinterpret_cast<const unsigned char*>(down_q);
+    const dim3 ggu((2 * ffn) / 32, SHEXP_MMA_SPLITS), gdn(hidden / 32, 1);
+    if (rows <= 16) shexp_q8_mma_kernel<1><<<ggu, 128, 0, stream>>>(q, hidden, g, u, ffn, rows, 2 * ffn, part, nullptr);
+    else            shexp_q8_mma_kernel<2><<<ggu, 128, 0, stream>>>(q, hidden, g, u, ffn, rows, 2 * ffn, part, nullptr);
+    shexp_q8_gu_reduce_kernel<<<(rows * ffn + 255) / 256, 256, 0, stream>>>(
+        part, SHEXP_MMA_SPLITS, rows, ffn, dw, h_scratch);
+    quant_h_q8_1_kernel<<<((rows * (ffn >> 5)) + 7) / 8, 8 * 32, 0, stream>>>(
+        h_scratch, hq, rows * (ffn >> 5), 0);
+    if (rows <= 16) shexp_q8_mma_kernel<1><<<gdn, 128, 0, stream>>>(hq, ffn, d, d, hidden, rows, hidden, nullptr, out);
+    else            shexp_q8_mma_kernel<2><<<gdn, 128, 0, stream>>>(hq, ffn, d, d, hidden, rows, hidden, nullptr, out);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 void launch_shared_expert_q8_mmvq_rows(
     const void* input_q8, const void* gate_q, const void* up_q, const void* down_q,
     const float* dw, void* output, float* h_scratch, void* h_q8_buf,
     int hidden, int ffn, int rows, cudaStream_t stream) {
     if (!input_q8 || !gate_q || !up_q || !down_q || !dw || !output || !h_scratch ||
-        !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1 || rows > 8) return;
+        !h_q8_buf || hidden != 2048 || ffn != 512 || rows < 1) return;
+    // More than eight rows: one 16 / 24 / 32-row launch triple for the bulk, the exact <=8-row
+    // kernels for the rest. Each row's dots are computed alone, in the same order, whatever R is,
+    // so a row's result is the same in any chunk. Eight-row chunks were four launch triples at 32
+    // rows, each re-reading the shared expert and paying its own setup: 2.8 ms of a 14 ms packed
+    // Qwen3.6 step. SPARKINFER_SHEXP_ROWS_WIDE=0 restores the eight-row chunks.
+    static const bool wide = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_ROWS_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    static const int wide_max = [] {
+        const char* e = getenv("SPARKINFER_SHEXP_ROWS_MAX");
+        const int v = e ? atoi(e) : 32;
+        return (v == 16 || v == 24) ? v : 32;
+    }();
     const auto* q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+    if (rows > 8 && launch_shared_expert_q8_mma(
+                        q, gate_q, up_q, down_q, dw, reinterpret_cast<__nv_bfloat16*>(output),
+                        h_scratch, reinterpret_cast<si_block_q8_1*>(h_q8_buf), hidden, ffn, rows,
+                        stream))
+        return;
+    if (rows > 8) {
+        const int cap = wide_max;
+        const int big = !wide ? 8 : (rows >= 32 && cap >= 32) ? 32 : (rows >= 24 && cap >= 24) ? 24
+                                  : rows >= 16 ? 16 : 8;
+        int r0 = 0;
+        if (big > 8) {
+            auto* hq0 = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
+            auto* out0 = reinterpret_cast<__nv_bfloat16*>(output);
+#define SI_SHARED_WIDE(R) do { \
+    shared_gate_up_q8_mmvq_rows_kernel<2048, 512, R><<<512, si_shexp_nw<2048, 32>() * 32, 0, stream>>>( \
+        q, reinterpret_cast<const unsigned char*>(gate_q), \
+        reinterpret_cast<const unsigned char*>(up_q), dw, h_scratch); \
+    quant_h_q8_1_kernel<<<((R * (512 >> 5)) + 7) / 8, 8 * 32, 0, stream>>>( \
+        h_scratch, hq0, R * (512 >> 5), 0); \
+    shared_down_q8_mmvq_rows_kernel<2048, 512, R><<<(2048 + WPB * 2 - 1) / (WPB * 2), WPB * 32, 0, stream>>>( \
+        hq0, reinterpret_cast<const unsigned char*>(down_q), out0); \
+} while (0)
+            if (big == 32) SI_SHARED_WIDE(32);
+            else if (big == 24) SI_SHARED_WIDE(24);
+            else SI_SHARED_WIDE(16);
+#undef SI_SHARED_WIDE
+            r0 = big;
+        }
+        if (r0 > 0 && rows - r0 > 8) {
+            // What a capped chunk left over goes round again (a 32-row step at cap 16: 16 + 16).
+            launch_shared_expert_q8_mmvq_rows(
+                q + (size_t)r0 * (hidden >> 5), gate_q, up_q, down_q, dw + r0,
+                reinterpret_cast<__nv_bfloat16*>(output) + (size_t)r0 * hidden, h_scratch, h_q8_buf,
+                hidden, ffn, rows - r0, stream);
+            return;
+        }
+        for (; r0 < rows; r0 += 8)
+            launch_shared_expert_q8_mmvq_rows(
+                q + (size_t)r0 * (hidden >> 5),
+                gate_q, up_q, down_q, dw + r0,
+                reinterpret_cast<__nv_bfloat16*>(output) + (size_t)r0 * hidden, h_scratch, h_q8_buf,
+                hidden, ffn, rows - r0 < 8 ? rows - r0 : 8, stream);
+        return;
+    }
     auto* hq = reinterpret_cast<si_block_q8_1*>(h_q8_buf);
     auto* out = reinterpret_cast<__nv_bfloat16*>(output);
 #define SI_SHARED_ROWS(R) do { \

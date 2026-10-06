@@ -104,6 +104,17 @@ public:
     explicit KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes);
     ~KVCacheManager();
 
+    // Re-size the pool to pool_bytes (same bf16-denominated budget the constructor takes) while
+    // nothing holds a block: no sequence, no ring, no retained prefix. The old device buffers are
+    // freed BEFORE the new ones are allocated, so the new pool may use their memory. Every pointer
+    // previously returned (k_pool, v_pool, block tables) is invalidated, so call it only before
+    // anything has captured them -- in practice, at startup before the first request. False if
+    // the pool is not idle, or if the new allocation failed (the manager is then left empty;
+    // call again with the old size).
+    bool resize_idle(size_t pool_bytes);
+    // Device bytes the pool actually holds (int8 or bf16 elements, scales and tables included).
+    size_t resident_bytes() const;
+
     // Allocate physical blocks for a sequence (grows if already allocated).
     // Returns false if OOM. Idempotent when num_tokens fits existing allocation.
     bool allocate(uint64_t seq_id, int num_tokens);
@@ -170,6 +181,9 @@ public:
     void* k_scale_pool() const;
     void* v_scale_pool() const;
     size_t scale_layer_stride_elems() const;
+    // One block of one slot: K (or V) elements, and (int8) its K (or V) scales; 0 without int8.
+    size_t block_elems() const;
+    size_t block_scale_elems() const;
 
     // WINDOWED SLOTS (see KVCacheConfig::window_tokens). windowed() is false when this pool has
     // none, and then every accessor below behaves exactly as the full-context ones.
@@ -189,6 +203,9 @@ public:
     int max_blocks_per_seq() const;
     int num_free_blocks() const;
     int num_total_blocks() const;
+    // Holders of physical block b (sequences and non-sequence holders such as the prefix cache);
+    // 0 for a free or unknown block.
+    int block_refs(int physical_id) const;
 
 private:
     struct Impl;

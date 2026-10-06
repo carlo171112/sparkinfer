@@ -44,38 +44,47 @@ export SPARKINFER_ROOT="$(pwd)"
 ./build/server/sparkinfer_server -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --port 8080
 ```
 
-### Serve Qwen3.8 with DSpark
+### Serve Qwen3.8 with speculative decoding
 
-The release container downloads both blessed checkpoints and starts the OpenAI-compatible server
-with DSpark enabled:
+The release container speculates by default: it downloads the target and z-lab's DFlash2 drafter
+and starts the OpenAI-compatible server with both (`-e SPEC_DRAFT=none` serves without one;
+`serve-dspark` uses the DSpark drafter instead):
 
 ```bash
 docker run --gpus all -p 8080:8080 -v qwen38:/models \
-  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest serve-dspark
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:latest
 ```
 
-For a source build, pass the downloaded drafter directory explicitly:
+For a source build, pass the drafter directory explicitly:
 
 ```bash
 ./build/server/sparkinfer_server \
   -m models/Qwen3.8-27B-NVFP4-RTX5090 \
   --tokenizer models/Qwen3.8-27B-NVFP4-RTX5090/tokenizer.json \
-  --draft-model models/Qwen3.8-27B-DSpark-NVFP4 \
+  --draft-model models/Qwen3.8-27B-DFlash2 \
   --ctx 131072 --host 0.0.0.0 --port 8080
 ```
 
 The KV pool is sized for the whole `--ctx` before the drafter loads. On a 32 GB card, 262,144 tokens
-leaves no device memory for the drafter, which is why this example and `serve-dspark` use
-131,072.
+leaves no device memory for the drafter, which is why this example and the container use 131,072.
 
-An explicitly requested drafter is a startup requirement: a missing or incompatible checkpoint, or
-one that does not fit in device memory, terminates the server rather than quietly changing
-performance. DSpark is selected only for
-greedy, plain-text requests while they are the sole active request. Vision, sampling, penalties,
-logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
-hand off to lossless autoregressive decoding. `/metrics` exposes
-`sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
-`sparkinfer_speculative_handoffs_total` so this is observable in production.
+- **A drafter you ask for is required:** a missing or incompatible checkpoint, or one that does
+  not fit in device memory, terminates the server rather than quietly changing performance. The
+  container's default drafter is the exception: if it cannot be downloaded the container serves
+  without it.
+- **What speculates:** up to `SPARKINFER_SPEC_GROUP` (8) fresh requests at a time, greedy or
+  sampled. A request speculates from its start up to the end of the drafter's context
+  (`SPARKINFER_DSPARK_MAX_CTX`): the whole `--ctx` for DFlash2, whose layers all attend a sliding
+  window, and 16,384 positions for DSpark. A member that reaches it stays in its group and
+  verifies one token a step without a draft. With `SPARKINFER_SPEC_GROUP=1` a request whose prompt
+  plus `max_tokens` exceeds that context does not speculate at all.
+- **What does not:** requests with tools, `response_format` JSON schemas or other constraints,
+  vision, penalties, logit bias, logprobs, forced tokens or a prefix session take the ordinary
+  path, as do all requests while more are live than a group takes.
+- **Same tokens:** a request speculating alone gives the tokens ordinary decode gives (greedy, or
+  sampled with a seed). A group verifies with batch arithmetic, as packed decode does.
+- **Observability:** `/metrics` exposes `sparkinfer_speculative_runs_total`,
+  `sparkinfer_speculative_tokens_total` and `sparkinfer_speculative_handoffs_total`.
 
 ### Serve a GGUF instead of NVFP4
 
@@ -497,7 +506,7 @@ What is never cached: `/v1/score` (its numbers must not depend on another reques
 with images or video (the cache keys on token ids, and every image's placeholder tokens are the
 same ids).
 
-Memory. Entries hold KV blocks (capped at half the pool) and snapshots in host RAM
+Memory. Entries hold KV blocks (up to three quarters of the pool) and snapshots in host RAM
 (`SPARKINFER_PREFIX_CACHE_HOST_MB`). When a new request cannot get KV blocks, least-recently-used
 entries are evicted before it is refused. `/metrics` reports `sparkinfer_prefix_cache_*` hits,
 reused tokens, evictions, entries, blocks and host bytes.
@@ -532,17 +541,23 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_SERVER_PREFIX_TOKEN_FILE` | — | JSON `[id,...]` warmed via `cache_prefix` each request |
 | `SPARKINFER_SERVER_PREFIX_TOKEN_IDS` | — | Comma-separated token ids (same as above) |
 | `SPARKINFER_PREFIX_CACHE` | `1` | Automatic prefix cache (see **Automatic prefix cache**). `0` disables; `SPARKINFER_DETERMINISTIC=1` also disables it. |
-| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `32` | Most cached prefixes held at once; least-recently-used is evicted. |
-| `SPARKINFER_PREFIX_CACHE_HOST_MB` | `8192` | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). Up to 8 more snapshot buffers are kept pinned for reuse; `SPARKINFER_SNAPSHOT_POOL=0` allocates and frees one per snapshot instead. |
+| `SPARKINFER_PREFIX_CACHE_ENTRIES` | `256` | Most cached prefixes held at once; least-recently-used is evicted. In practice the memory limits below bind first. |
+| `SPARKINFER_PREFIX_CACHE_KV_PCT` | `75` | Share of the KV pool cached prefixes may hold. A request that needs the room evicts least-recently-used entries first, and `/v1/capacity` / `sparkinfer_free_kv_blocks` count blocks only the cache holds as free. |
+| `SPARKINFER_PREFIX_CACHE_HOST_MB` | a quarter of RAM, 8192-32768 | Pinned host memory for recurrent-state snapshots (~205 MB each on Qwen3.8-27B; none on Muse Glimmer). Up to 8 more snapshot buffers are kept pinned for reuse; `SPARKINFER_SNAPSHOT_POOL=0` allocates and frees one per snapshot instead. |
 | `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
-| `SPARKINFER_PREFILL_ALIGN8_MIN` | `128` | On a model with NVFP4 prefill, a pass whose length is not a multiple of 8 prefills its aligned body in one pass and decodes the last 1–7 tokens, because the NVFP4 GEMMs take multiples of 8 rows (up to 1.9x faster prefill). The smallest body split this way; `0` turns it off. |
+| `SPARKINFER_PREFILL_ALIGN8_MIN` | `8` | On a model with NVFP4 prefill, a pass whose length is not a multiple of 8 prefills its aligned body in one pass and the last 1–7 tokens in one more forward, because the NVFP4 GEMMs take multiples of 8 rows (up to 3x faster for a short prompt, 1.9x for a long one). The smallest body split this way; `0` turns it off. |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` (container: `16384`) | Per-request generation cap. A request without `max_tokens` generates until the model stops, up to this cap or the room its prompt leaves in the context; a larger `max_tokens` is clamped to this cap. Each request reserves KV blocks for its prompt plus `max_tokens` when it is admitted, so a cap near the full context lets one long request hold the whole pool while other requests wait for it (see `SPARKINFER_ADMISSION_WAIT_S`). |
-| `SPARKINFER_DRAFT_MODEL` | — | DSpark drafter directory, same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
-| `SPARKINFER_DSPARK_MAX_CTX` | `16384` | Context the DSpark drafter attends over (its own KV cache), capped at `--ctx`. |
+| `SPARKINFER_DRAFT_MODEL` | — | Drafter directory (DFlash2 or DSpark), same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
+| `SPARKINFER_DSPARK_MAX_CTX` | `--ctx` for a drafter whose layers all attend a sliding window (DFlash2), else `16384` | Context a request can speculate through (the drafter's positions), capped at `--ctx`. |
+| `SPARKINFER_DRAFT_OFFLOAD_MS` | `1000` | With a drafter loaded, how long live requests must stay more than a speculation group takes before the drafter's device memory (~3 GB for DFlash2) moves to pinned host memory. Nothing reads it while no group can form, and on a 32 GB card it is the headroom concurrent prefill and decode need. It comes back (~0.1 s) at the same addresses when a group can form again and the device has room for it. A prefill or a new session that runs out of memory beside an idle drafter moves it at once, whatever this is set to. `-1` turns off only the timed move; `SPARKINFER_DRAFT_OFFLOAD=0` keeps the drafter on the device always. It needs pinned host memory of ~1.25x the drafter (~3.8 GB for DFlash2). |
+| `SPARKINFER_DRAFT_OFFLOAD` | `1` | `0` allocates the drafter with plain `cudaMalloc`, so it can never leave the device (the behaviour before the offload). |
+| `SPARKINFER_DRAFT_RESTORE_HEADROOM_MB` | `1024` | Free device memory, beyond the drafter itself, required to bring it back. Below that, requests decode without speculation until there is room. |
+| `SPARKINFER_SPEC_JOIN_ROOM` | `1` | A prompt joins a speculation group only if the device has room for its prefill, its captured context, its draft slot and the verify, checked before anything is allocated; otherwise it prefills on the ordinary path. `0` skips the check. |
+| `SPARKINFER_SPEC_GROUP` | `8` | With a drafter loaded, how many live requests speculate together: up to this many fresh prompts each draft their own block (one batched draft pass with DFlash2), and one forward verifies all the blocks -- past four members each verifies a shorter block, to fit the 32-row verify. A request speculation cannot take (logprobs, penalties, a constraint, an image) or one more than this hands every member over to ordinary decode at its committed position. `1` speculates only a request that is alone, and stops at the next arrival. |
 | `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Requests waiting for KV capacity count toward it. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
-| `SPARKINFER_SAMPLING_DEFAULTS` | `generation_config` | What a request that omits `temperature`, `top_k` or `top_p` gets. `generation_config` uses the checkpoint's `generation_config.json` (Qwen3.8: temperature 1.0, top_k 20, top_p 0.95), as vLLM does; greedy decoding makes a thinking model loop on long agent tasks. `greedy` restores greedy decoding for those requests. A checkpoint without the file, and `SPARKINFER_DETERMINISTIC=1`, stay greedy. An explicit value, including `temperature: 0`, always wins. DSpark only speeds up greedy requests, so clients that want it should send `temperature: 0`. |
+| `SPARKINFER_SAMPLING_DEFAULTS` | `generation_config` | What a request that omits `temperature`, `top_k` or `top_p` gets. `generation_config` uses the checkpoint's `generation_config.json` (Qwen3.8: temperature 1.0, top_k 20, top_p 0.95), as vLLM does; greedy decoding makes a thinking model loop on long agent tasks. `greedy` restores greedy decoding for those requests. A checkpoint without the file, and `SPARKINFER_DETERMINISTIC=1`, stay greedy. An explicit value, including `temperature: 0`, always wins. DSpark speeds up greedy and sampled requests alike (`SPARKINFER_SPEC_SAMPLED=0` limits it to greedy ones). |
 | `SPARKINFER_ADMISSION_WAIT_S` | `300` | How long a request that finds no free KV capacity waits for it before `429`, oldest first. Set `0` to refuse immediately instead of waiting, which is what a gateway that promises "reserve or `429`, never queue" wants (pair it with `SPARKINFER_MAX_QUEUE_DEPTH`). A request whose session memory cannot be allocated while other requests are running waits the same way, since their prefill scratch and session state come back as they progress; with nothing else running it gets `503` at once. `0` rejects immediately, the earlier behaviour. When `SPARKINFER_REQUEST_TIMEOUT_S` is set and shorter, the wait ends there and returns `504`. `/metrics` reports `sparkinfer_waiting_requests`, `sparkinfer_admission_waits_total` and `sparkinfer_admission_wait_timeouts_total`; `/v1/capacity` reports `waiting_requests`. |
 | `SPARKINFER_SPARSE_GQA6` | `0` | `1` makes Qwen3.8 decode attend only the first KV block and the last 4096 tokens once a sequence reaches 16384 tokens. Faster long-context decode, but the model can no longer read anything in between: a long agent session loses its earlier tool results and instructions. Leave it off unless every request is known to need only recent context. |
 | `SPARKINFER_PRESERVE_THINKING` | `1` | `0` replays a previous assistant turn's reasoning only for the turns since the last user message, instead of the whole history. The checkpoint's own chat template preserves all of it (llama.cpp calls this `--reasoning-preserve`); a request's `chat_template_kwargs.preserve_thinking` overrides either way. Reasoning only reaches the model if the client sends it back — as `reasoning_content`, as `reasoning` (the alias the server also emits), or left inside `<think>` tags in `content`. An assistant message may be appended verbatim: every field the server emits is accepted back, along with the `refusal` / `annotations` / `audio` / `function_call` nulls the OpenAI SDKs carry. |
@@ -566,8 +581,10 @@ above. Pass them with `-e NAME=value`. Server flags appended after the image nam
 |----------|---------|---------|
 | `CTX` | `131072` | Context length, passed as `--ctx`. `262144` fits the model's full context but leaves ~3 GB on a 32 GB card, too little for concurrent requests to batch (the server warns at startup below 5 GiB free); use it for one long conversation at a time. |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
-| `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. |
+| `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. A missing default DFlash2 drafter is not an error: the server runs without speculation and says so. |
 | `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |
+| `SPEC_DRAFT` | `dflash2` | The default `serve` mode's drafter: `dflash2` downloads and loads `DFLASH2_REPO`, `none` serves without one. Ignored by `serve-dspark` and when `SPARKINFER_DRAFT_MODEL` or `--draft-model` is given. Past a 131,072-token context the default skips the drafter (no room for it on a 32 GB card). |
+| `DFLASH2_REPO` / `DFLASH2_DIR` | `z-lab/Qwen3.8-27B-DFlash2` / `/models/qwen38-dflash2` | The default drafter |
 | `DRAFT_REPO` / `DRAFT_DIR` | `gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` / `/models/qwen38-dspark` | DSpark drafter, used by `serve-dspark` |
 | `MODEL_NAME` | `qwen38-nvfp4` | Model id the API advertises |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Listen address inside the container |
