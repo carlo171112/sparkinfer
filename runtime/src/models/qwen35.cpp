@@ -1964,6 +1964,40 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         pf_outstanding = true;
     };
     auto pf_fork = [&](const void* a, const void* b) { pf_fork_n(a, b, pf_bytes); };
+    // ---- Ternary-Bonsai-2: L2 prefetch of the next GEMVs' weights across the kernels between ----
+    // The decode shadow's layer is a chain of GEMVs streaming the weights at ~80% of the bus, with
+    // latency-bound kernels between them (the conv and the scan, the norms, the rotations) during
+    // which the bus idles. Each window forks a TMA bulk L2 prefetch (launch_l2_prefetch_bulk) of the
+    // weights the next GEMVs read onto the prefetch stream as the GEMV before it finishes; the
+    // window is joined at the next fork (or at the end of the step), so the main stream never waits
+    // on one that has not landed. Windows, measured at ctx 4096 (decode tok/s, 256 tokens):
+    //   A  after the GDN in-projections, across the conv, the scan and the gated norm: ssm_out
+    //      whole and the head of gate (A_MB, 16)                        194.7 -> 199.8
+    //   C  after down, across the post-FFN norm: the head of the next in-projection (C_MB, 8)
+    //   D  after gate/up, across the SwiGLU rotation: the head of down (D_MB, 8)
+    //                                                          A + C + D:  194.7 -> 203.5
+    // Left out: the same window across an attention layer's attention (199.9 -> 198.9) and one
+    // across the post-attention norm (its join waits on window A: 199.9 -> 197.5).
+    // Prefetches have no side effects: every output is bit-identical. SPARKINFER_BONSAI_L2PF=0 turns
+    // them off; SPARKINFER_BONSAI_L2PF_{A,C,D}_MB size each window (0 skips it).
+    auto env_int = [](const char* n, int d) { const char* e = getenv(n); return e ? atoi(e) : d; };
+    static const bool bpf_on = env_int("SPARKINFER_BONSAI_L2PF", 1) != 0;
+    static const size_t bpf_a = (size_t)std::max(0, env_int("SPARKINFER_BONSAI_L2PF_A_MB", 16)) << 20;
+    static const size_t bpf_c = (size_t)std::max(0, env_int("SPARKINFER_BONSAI_L2PF_C_MB", 8)) << 20;
+    static const size_t bpf_d = (size_t)std::max(0, env_int("SPARKINFER_BONSAI_L2PF_D_MB", 8)) << 20;
+    const bool bpf = bpf_on && !c.muse_glimmer && !s.bonsai_dec_layers.empty() && s.stream_pf;
+    // A ternary matrix's bytes: rows of k/128 28-byte blocks.
+    auto tbytes = [](long rows, long k) { return (size_t)rows * (size_t)(k / 128) * 28; };
+    auto bpf_fork = [&](const void* a, size_t na, const void* b, size_t nb) {
+        if (!bpf || ((!a || !na) && (!b || !nb))) return;
+        pf_join();
+        cu(cudaEventRecord(s.ev_pf_fork, st), "bonsai l2 prefetch fork");
+        cu(cudaStreamWaitEvent(s.stream_pf, s.ev_pf_fork, 0), "bonsai l2 prefetch fork wait");
+        if (a && na) kernels::launch_l2_prefetch_bulk(a, na, s.stream_pf);
+        if (b && nb) kernels::launch_l2_prefetch_bulk(b, nb, s.stream_pf);
+        cu(cudaEventRecord(s.ev_pf_done, s.stream_pf), "bonsai l2 prefetch done");
+        pf_outstanding = true;
+    };
     // A single fork per layer issuing every prefetch back-to-back was tried and is WORSE than
     // doing nothing (98.37 vs 99.44 tok/s): the side stream then hammers DRAM through the QKV
     // projections it is supposed to hide behind, and gate/up is evicted long before the FFN reads
@@ -2244,6 +2278,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         (int)s.linear_qkvdim, (int)H, st, s.bonsai_part, s.bonsai_part_slot);
                 if (!qkv_splits)
                     gemv8(w.wqkv, nullptr, s.lin_qkv, nullptr, (int)s.linear_qkvdim, (int)H, st, 0);
+                bpf_fork(w.ssm_out, tbytes(H, s.linear_vdim), w.gate_q,
+                         std::min(tbytes(c.moe_ffn, H), bpf_a));   // window A
             } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
@@ -2936,6 +2972,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_gemv_ptq1_q2(hq, s.bonsai_rot_hn, w.gate_q, w.up_q,
                                                  s.bonsai_ffn_gate, s.bonsai_ffn_up, c.moe_ffn, H,
                                                  st);
+                    bpf_fork(w.down_q, std::min(tbytes(H, c.moe_ffn), bpf_d), nullptr, 0);   // D
                 } else {
                     kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
                                                          H, (int)H, (int)s.bonsai_block, st);
@@ -2960,6 +2997,12 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         (int)s.bonsai_block, st);
                     kernels::launch_gemv_ptq1_q(fq, s.bonsai_ffn_h, w.down_q, s.routed, H,
                                                 c.moe_ffn, st);
+                    if (L + 1 < c.n_layers) {   // window C
+                        const Qwen35LayerWeights& nx = s.bonsai_dec_layers[L + 1];
+                        const long nr = nx.linear_attn ? (long)s.linear_qkvdim : 2L * s.qdim;
+                        bpf_fork(nx.linear_attn ? nx.wqkv : nx.wq, std::min(tbytes(nr, H), bpf_c),
+                                 nullptr, 0);
+                    }
                 } else {
                     kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
                                                          s.bonsai_sign_ffn, c.moe_ffn,
@@ -10252,6 +10295,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }
     if (bonsai_shadow && !shadow_of.empty()) {
         s.bonsai_dec_layers = s.w.layers;
+        // The decode shadow's L2 prefetch windows (see bpf_fork in forward_token) run on the
+        // prefetch stream Muse Glimmer creates at construction; a shadow-carrying model gets it here.
+        if (!s.stream_pf) {
+            cudaStreamCreateWithFlags(&s.stream_pf, cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&s.ev_pf_fork, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&s.ev_pf_done, cudaEventDisableTiming);
+        }
         int n_proj = 0, n_ffn = 0;
         auto swap_in = [&](const void*& ptr, int& type) {
             const auto it = shadow_of.find(ptr);
